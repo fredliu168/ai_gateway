@@ -2,6 +2,8 @@
 
 **语言：** [English](README.md) | 简体中文
 
+本项目采用 [MIT License](LICENSE)。
+
 Rust + SQLite + Redis 的企业大模型转发管理平台。平台使用本地账号体系，按 Token 价格对模型调用计费，并提供部门额度、个人额度、统计与审计。
 
 ## 本地开发

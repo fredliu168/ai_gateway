@@ -81,6 +81,7 @@ cd web && npm run build
 - [简体中文 documentation](README.zh-CN.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Security policy](SECURITY.md)
+- [MIT License](LICENSE)
 - [Product requirements (Chinese)](需求说明书.md)
 
-Please report security issues privately as described in [SECURITY.md](SECURITY.md). A license has not yet been selected; until a `LICENSE` file is added, no permission to use, modify, or redistribute this code is granted by this repository.
+Please report security issues privately as described in [SECURITY.md](SECURITY.md). This project is licensed under the MIT License; see [LICENSE](LICENSE) for details.

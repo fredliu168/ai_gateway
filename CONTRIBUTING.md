@@ -7,7 +7,7 @@ Thanks for considering a contribution. The project is evolving, so please keep c
 - Search existing issues and pull requests to avoid duplicate work.
 - For a substantial change, open an issue first to discuss scope and compatibility.
 - Do not submit secrets, production data, credentials, or real user content.
-- The project currently has no `LICENSE` file. Contributions do not grant permission to use or redistribute the project; please wait for the maintainers to publish a license before relying on it.
+- The project is distributed under the [MIT License](LICENSE). By submitting a contribution, you agree that it will be made available under the same license.
 
 ## Development setup
 
