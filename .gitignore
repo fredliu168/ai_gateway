@@ -1,0 +1,7 @@
+.env
+.DS_Store
+target/
+node_modules/
+web/dist/
+web/node_modules/
+server/data/

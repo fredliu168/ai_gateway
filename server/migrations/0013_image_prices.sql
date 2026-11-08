@@ -1,0 +1,4 @@
+ALTER TABLE model_prices ADD COLUMN input_image_1k_micros INTEGER NOT NULL DEFAULT 20000;
+ALTER TABLE model_prices ADD COLUMN input_image_2k_micros INTEGER NOT NULL DEFAULT 20000;
+ALTER TABLE model_prices ADD COLUMN output_image_1k_micros INTEGER NOT NULL DEFAULT 180000;
+ALTER TABLE model_prices ADD COLUMN output_image_2k_micros INTEGER NOT NULL DEFAULT 180000;

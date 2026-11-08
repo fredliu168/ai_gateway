@@ -1,0 +1,21 @@
+[Unit]
+Description=LLMRoute Gateway
+After=network.target redis-server.service
+
+[Service]
+Type=simple
+User=llmroute
+Group=llmroute
+WorkingDirectory=/opt/llmroute
+EnvironmentFile=/etc/llmroute/llmroute.env
+ExecStart=/opt/llmroute/llmroute-server
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/llmroute
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,51 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_ENV: production
+      REDIS_URL: redis://redis:6379/
+      AGENT_SANDBOX_URL: http://agent-sandbox:8090
+      AGENT_SANDBOX_SECRET: ${AGENT_SANDBOX_SECRET:?Set AGENT_SANDBOX_SECRET in .env}
+    ports:
+      - "7900:7900"
+    volumes:
+      - llmroute-data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      agent-sandbox:
+        condition: service_healthy
+  agent-sandbox:
+    build: ./sandbox
+    restart: unless-stopped
+    environment:
+      AGENT_SANDBOX_SECRET: ${AGENT_SANDBOX_SECRET:?Set AGENT_SANDBOX_SECRET in .env}
+      AGENT_SANDBOX_CONCURRENCY: 8
+      AGENT_SANDBOX_TOTAL_WORKSPACE_BYTES: 21474836480
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - agent-sandbox-control:/var/lib/sandbox
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 30s
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  llmroute-data:
+  redis-data:
+  agent-sandbox-control:
