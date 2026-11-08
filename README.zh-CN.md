@@ -32,6 +32,8 @@ Web 开发地址为 http://localhost:5173，API 端口为 7900。管理员账号
 
 系统管理员可配置多个渠道，每个渠道可接入多个模型；各模型单独维护价格。渠道保存上游协议、地址和加密后的凭据。
 
+创建渠道时可一键读取上游模型目录，并手动移除不需要接入的模型；也支持手动填写模型标识。
+
 网关支持 OpenAI Chat Completions、Anthropic Messages 和 DashScope 原生 Generation 三种客户端协议，均支持流式与非流式响应。使用同一 API 密钥和平台模型标识；协议适配共用额度检查、用量统计和计费。模型如通过 OpenAI 兼容流式数据返回 `reasoning_content`，Playground 会显示思考内容。
 
 ## 网关调用

@@ -11,6 +11,7 @@ LLMRoute is a self-hosted AI model gateway for teams. It combines model routing,
 - Route requests to configured providers using OpenAI Chat Completions, Anthropic Messages, or DashScope Generation APIs.
 - Support streaming and non-streaming text requests, plus image generation where the selected provider and model support it.
 - Manage users, departments, API keys, monthly quotas, model prices, and usage records.
+- Discover models from a configured upstream channel, then choose which models to add.
 - Store usage and audit metadata without storing prompt or model response bodies.
 - Run locally or deploy with Docker Compose; SQLite is used for persistent application data and Redis is optional for caching.
 

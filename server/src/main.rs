@@ -712,8 +712,12 @@ struct PriceInput {
     output_image_2k_micros: i64,
     effective_from: String,
 }
-fn default_input_image_price_micros() -> i64 { 20_000 }
-fn default_output_image_price_micros() -> i64 { 180_000 }
+fn default_input_image_price_micros() -> i64 {
+    20_000
+}
+fn default_output_image_price_micros() -> i64 {
+    180_000
+}
 #[derive(Deserialize)]
 struct ProtocolInput {
     model: String,
@@ -732,6 +736,24 @@ struct ModelRouteInput {
     endpoint: String,
     billing_mode: String,
     enabled: bool,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+#[derive(Deserialize)]
+struct ModelDiscoveryInput {
+    protocol: String,
+    endpoint: String,
+    #[serde(default)]
+    api_key: Option<String>,
+}
+#[derive(Deserialize)]
+struct ModelBatchInput {
+    source: String,
+    protocol: String,
+    endpoint: String,
+    billing_mode: String,
+    enabled: bool,
+    model_keys: Vec<String>,
     #[serde(default)]
     api_key: Option<String>,
 }
@@ -1259,7 +1281,10 @@ async fn login_captcha(
     let now = Utc::now().timestamp();
     let ip_key = login_bucket_key("captcha_ip", &remote.ip().to_string());
     if consume_login_attempt(&s.db, &ip_key, 60, now).await? {
-        return Err(fail(StatusCode::TOO_MANY_REQUESTS, "验证码请求过多，请稍后重试"));
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "验证码请求过多，请稍后重试",
+        ));
     }
 
     let id = Uuid::new_v4().to_string();
@@ -1276,21 +1301,27 @@ async fn login_captcha(
         .execute(&s.db)
         .await
         .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "验证码服务暂不可用"))?;
-    sqlx::query("INSERT INTO login_captcha_challenges(captcha_id,answer_hash,expires_at) VALUES(?,?,?)")
-        .bind(&id)
-        .bind(answer_hash)
-        .bind(now + 300)
-        .execute(&s.db)
-        .await
-        .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "验证码服务暂不可用"))?;
+    sqlx::query(
+        "INSERT INTO login_captcha_challenges(captcha_id,answer_hash,expires_at) VALUES(?,?,?)",
+    )
+    .bind(&id)
+    .bind(answer_hash)
+    .bind(now + 300)
+    .execute(&s.db)
+    .await
+    .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "验证码服务暂不可用"))?;
 
-    let mut svg = String::from("<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"160\" height=\"54\" viewBox=\"0 0 160 54\"><rect width=\"160\" height=\"54\" rx=\"7\" fill=\"#f4f6fb\"/>");
+    let mut svg = String::from(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"160\" height=\"54\" viewBox=\"0 0 160 54\"><rect width=\"160\" height=\"54\" rx=\"7\" fill=\"#f4f6fb\"/>",
+    );
     for i in 0..7 {
         let x1 = (random[i % 5] as usize * 7 + i * 19) % 160;
         let y1 = (random[(i + 1) % 5] as usize * 3 + i * 11) % 54;
         let x2 = (random[(i + 2) % 5] as usize * 5 + i * 23) % 160;
         let y2 = (random[(i + 3) % 5] as usize * 9 + i * 5) % 54;
-        svg.push_str(&format!("<path d=\"M{x1} {y1} L{x2} {y2}\" stroke=\"#cbd2e0\" stroke-width=\"1\"/>"));
+        svg.push_str(&format!(
+            "<path d=\"M{x1} {y1} L{x2} {y2}\" stroke=\"#cbd2e0\" stroke-width=\"1\"/>"
+        ));
     }
     let colors = ["#526be0", "#a05cb4", "#278b78", "#c36a47", "#48566b"];
     for (index, ch) in answer.chars().enumerate() {
@@ -1300,8 +1331,13 @@ async fn login_captcha(
         svg.push_str(&format!("<text x=\"{x}\" y=\"{y}\" transform=\"rotate({angle} {x} {y})\" font-family=\"Arial,sans-serif\" font-size=\"29\" font-weight=\"700\" fill=\"{}\">{ch}</text>", colors[index]));
     }
     svg.push_str("</svg>");
-    let image = format!("data:image/svg+xml;base64,{}", BASE64.encode(svg.as_bytes()));
-    Ok(Json(json!({"captcha_id":id,"image":image,"expires_in":300})))
+    let image = format!(
+        "data:image/svg+xml;base64,{}",
+        BASE64.encode(svg.as_bytes())
+    );
+    Ok(Json(
+        json!({"captcha_id":id,"image":image,"expires_in":300}),
+    ))
 }
 
 async fn consume_login_captcha(
@@ -1320,7 +1356,10 @@ async fn consume_login_captcha(
     let Some((expected_hash, expires_at)) = row else {
         return Ok(false);
     };
-    let supplied_hash = format!("{:x}", Sha256::digest(format!("{id}:{}", answer.trim().to_ascii_uppercase()).as_bytes()));
+    let supplied_hash = format!(
+        "{:x}",
+        Sha256::digest(format!("{id}:{}", answer.trim().to_ascii_uppercase()).as_bytes())
+    );
     Ok(expires_at > now && expected_hash == supplied_hash)
 }
 
@@ -1349,7 +1388,10 @@ async fn login(
         ));
     }
     if !consume_login_captcha(&s.db, &input.captcha_id, &input.captcha, now).await? {
-        return Err(fail(StatusCode::UNAUTHORIZED, "验证码错误或已过期，请刷新验证码"));
+        return Err(fail(
+            StatusCode::UNAUTHORIZED,
+            "验证码错误或已过期，请刷新验证码",
+        ));
     }
     let row = sqlx::query("SELECT id,username,display_name,password_hash,role,department_id,active FROM users WHERE username=? COLLATE NOCASE OR email=? COLLATE NOCASE ORDER BY CASE WHEN username=? COLLATE NOCASE THEN 0 ELSE 1 END LIMIT 1")
         .bind(account).bind(account).bind(account).fetch_optional(&s.db).await.map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR,"账号查询失败"))?;
@@ -3112,7 +3154,14 @@ async fn add_price(
         ]
         .iter()
         .any(|x| *x < 0)
-        || [i.input_image_1k_micros,i.input_image_2k_micros,i.output_image_1k_micros,i.output_image_2k_micros].iter().any(|x|*x<0)
+        || [
+            i.input_image_1k_micros,
+            i.input_image_2k_micros,
+            i.output_image_1k_micros,
+            i.output_image_2k_micros,
+        ]
+        .iter()
+        .any(|x| *x < 0)
     {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -3184,6 +3233,292 @@ async fn model_routes(
     let rows=sqlx::query_as::<_,ModelRouteRow>("SELECT id,display_name,source,model_key,upstream_model,protocol,endpoint,billing_mode,enabled,(credential_ciphertext IS NOT NULL) AS has_credential FROM model_routes ORDER BY display_name").fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"模型来源查询失败"))?;
     Ok(Json(rows))
 }
+
+fn upstream_models_url(
+    endpoint: &str,
+    protocol: &str,
+) -> Result<reqwest::Url, (StatusCode, Json<Value>)> {
+    let mut url = reqwest::Url::parse(endpoint.trim())
+        .map_err(|_| fail(StatusCode::BAD_REQUEST, "API 地址无效"))?;
+    if !["http", "https"].contains(&url.scheme()) || url.host_str().is_none() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "API 地址必须是有效的 HTTP 或 HTTPS 地址",
+        ));
+    }
+    url.set_query(None);
+    url.set_fragment(None);
+    let path = url.path().trim_end_matches('/');
+    let base = if protocol == "dashscope" {
+        path.strip_suffix("/services/aigc/text-generation/generation")
+            .unwrap_or(path)
+    } else {
+        path.strip_suffix("/chat/completions")
+            .or_else(|| path.strip_suffix("/messages"))
+            .unwrap_or(path)
+    };
+    let base = if base.is_empty() { "/v1" } else { base };
+    let model_path = if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{}/models", base.trim_end_matches('/'))
+    };
+    url.set_path(&model_path);
+    Ok(url)
+}
+
+async fn get_upstream_models_page(
+    client: &reqwest::Client,
+    base_url: &reqwest::Url,
+    protocol: &str,
+    api_key: &str,
+    cursor: Option<&str>,
+    page_no: usize,
+) -> Result<Value, (StatusCode, Json<Value>)> {
+    let mut url = base_url.clone();
+    if protocol == "dashscope" {
+        url.query_pairs_mut()
+            .append_pair("page_no", &page_no.to_string())
+            .append_pair("page_size", "100");
+    } else if protocol == "anthropic" {
+        url.query_pairs_mut().append_pair("limit", "1000");
+        if let Some(cursor) = cursor {
+            url.query_pairs_mut().append_pair("after_id", cursor);
+        }
+    }
+
+    let mut request = client.get(url);
+    if protocol == "anthropic" {
+        request = request
+            .header("x-api-key", api_key)
+            .header("anthropic-version", "2023-06-01");
+    } else {
+        request = request.bearer_auth(api_key);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "无法连接上游模型列表接口"))?;
+    if !response.status().is_success() {
+        return Err(fail(
+            StatusCode::BAD_GATEWAY,
+            &format!("上游模型列表接口返回 HTTP {}", response.status().as_u16()),
+        ));
+    }
+    response
+        .json::<Value>()
+        .await
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "上游模型列表响应不是有效 JSON"))
+}
+
+async fn discover_models(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ModelDiscoveryInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let claims = admin(&headers, &s.jwt_secret)?;
+    if !["openai", "anthropic", "dashscope"].contains(&input.protocol.as_str()) {
+        return Err(fail(StatusCode::BAD_REQUEST, "不支持该渠道协议的模型发现"));
+    }
+    if input.endpoint.trim().is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "请填写 API 地址"));
+    }
+    let url = upstream_models_url(&input.endpoint, &input.protocol)?;
+    let api_key = input.api_key.as_deref().unwrap_or("").trim();
+    let api_key = if api_key.is_empty() {
+        s.upstream_key.as_str()
+    } else {
+        api_key
+    };
+    if api_key.is_empty() {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "请填写 API Key 或配置服务环境密钥",
+        ));
+    }
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "无法初始化上游请求"))?;
+
+    let mut models = Vec::<Value>::new();
+    let mut seen = std::collections::HashSet::<String>::new();
+    let mut cursor: Option<String> = None;
+    for page in 1..=100 {
+        let payload = get_upstream_models_page(
+            &client,
+            &url,
+            &input.protocol,
+            api_key,
+            cursor.as_deref(),
+            page,
+        )
+        .await?;
+        let list = if input.protocol == "dashscope" {
+            payload
+                .pointer("/output/models")
+                .or_else(|| payload.get("data"))
+        } else {
+            payload.get("data")
+        }
+        .and_then(Value::as_array)
+        .ok_or_else(|| fail(StatusCode::BAD_GATEWAY, "上游响应中未找到模型列表"))?;
+
+        for item in list {
+            let id = if input.protocol == "dashscope" {
+                item.get("model").or_else(|| item.get("id"))
+            } else {
+                item.get("id").or_else(|| item.get("model"))
+            }
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+            if let Some(id) = id {
+                if seen.insert(id.to_string()) {
+                    let name = item
+                        .get("display_name")
+                        .or_else(|| item.get("name"))
+                        .and_then(Value::as_str)
+                        .filter(|name| !name.trim().is_empty())
+                        .unwrap_or(id);
+                    models.push(json!({"id":id,"name":name}));
+                }
+            }
+        }
+
+        if input.protocol == "anthropic" {
+            let has_more = payload
+                .get("has_more")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let last_id = payload
+                .get("last_id")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            if !has_more || last_id.is_none() || last_id == cursor {
+                break;
+            }
+            cursor = last_id;
+        } else if input.protocol == "dashscope" {
+            let total = payload
+                .pointer("/output/total")
+                .and_then(Value::as_u64)
+                .unwrap_or(0) as usize;
+            if list.len() < 100 || (total > 0 && models.len() >= total) {
+                break;
+            }
+        } else {
+            break;
+        }
+        if models.len() >= 10_000 {
+            break;
+        }
+    }
+
+    audit(
+        &s.db,
+        &claims.sub,
+        "model.discover",
+        &input.protocol,
+        json!({"count":models.len()}),
+    )
+    .await;
+    Ok(Json(json!({"models":models})))
+}
+
+async fn save_model_batch(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ModelBatchInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let claims = admin(&headers, &s.jwt_secret)?;
+    if input.source.trim().is_empty()
+        || input.endpoint.trim().is_empty()
+        || !["openai", "anthropic", "dashscope"].contains(&input.protocol.as_str())
+        || !["pay_as_you_go", "subscription"].contains(&input.billing_mode.as_str())
+    {
+        return Err(fail(StatusCode::BAD_REQUEST, "渠道配置无效"));
+    }
+    let model_keys = input
+        .model_keys
+        .iter()
+        .map(|key| key.trim())
+        .filter(|key| !key.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+    if model_keys.is_empty() || model_keys.len() > 500 {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "模型数量必须在 1 到 500 个之间",
+        ));
+    }
+    let credential = match input.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => Some(encrypt_credential(&s.credentials_key, key).map_err(|_| {
+            fail(StatusCode::INTERNAL_SERVER_ERROR, "模型密钥加密失败")
+        })?),
+        None => sqlx::query_scalar::<_, String>(
+            "SELECT credential_ciphertext FROM model_routes WHERE source=? AND credential_ciphertext IS NOT NULL ORDER BY created_at LIMIT 1",
+        )
+        .bind(input.source.trim())
+        .fetch_optional(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "来源凭证查询失败"))?,
+    };
+
+    let mut tx =
+        s.db.begin()
+            .await
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型配置事务启动失败"))?;
+    let mut created = 0usize;
+    let mut skipped = 0usize;
+    for model_key in model_keys {
+        let existing = sqlx::query_as::<_, (String, String)>(
+            "SELECT id,source FROM model_routes WHERE model_key=?",
+        )
+        .bind(model_key)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型重复检查失败"))?;
+        if let Some((_, source)) = existing {
+            if source == input.source.trim() {
+                skipped += 1;
+                continue;
+            }
+            return Err(fail(
+                StatusCode::CONFLICT,
+                &format!("模型标识 {model_key} 已被其他渠道使用"),
+            ));
+        }
+        sqlx::query("INSERT INTO model_routes(id,display_name,source,model_key,upstream_model,protocol,endpoint,billing_mode,enabled,credential_ciphertext) VALUES(?,?,?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(model_key)
+            .bind(input.source.trim())
+            .bind(model_key)
+            .bind(model_key)
+            .bind(&input.protocol)
+            .bind(input.endpoint.trim())
+            .bind(&input.billing_mode)
+            .bind(input.enabled as i64)
+            .bind(credential.as_deref())
+            .execute(&mut *tx)
+            .await
+            .map_err(|_| fail(StatusCode::CONFLICT, "模型保存失败"))?;
+        created += 1;
+    }
+    tx.commit()
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型配置提交失败"))?;
+    audit(
+        &s.db,
+        &claims.sub,
+        "model.batch.create",
+        input.source.trim(),
+        json!({"created":created,"skipped":skipped}),
+    )
+    .await;
+    Ok(Json(json!({"created":created,"skipped":skipped})))
+}
 async fn save_model_route(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -3250,7 +3585,10 @@ async fn purge_expired_usage_records(db: &SqlitePool) {
     .await
     {
         Ok(result) if result.rows_affected() > 0 => {
-            tracing::info!(deleted = result.rows_affected(), "purged expired usage records");
+            tracing::info!(
+                deleted = result.rows_affected(),
+                "purged expired usage records"
+            );
         }
         Ok(_) => {}
         Err(error) => tracing::error!(%error, "failed to purge expired usage records"),
@@ -3384,6 +3722,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/protocols", get(protocols))
         .route("/api/protocols/{id}", put(put_protocol))
         .route("/api/models", get(model_routes))
+        .route("/api/models/discover", post(discover_models))
+        .route("/api/models/batch", post(save_model_batch))
         .route("/api/models/{id}", put(save_model_route))
         .fallback_service(
             ServeDir::new(&web_dist)
