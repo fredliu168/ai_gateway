@@ -744,6 +744,8 @@ struct ModelDiscoveryInput {
     protocol: String,
     endpoint: String,
     #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
     api_key: Option<String>,
 }
 #[derive(Deserialize)]
@@ -3324,12 +3326,38 @@ async fn discover_models(
         return Err(fail(StatusCode::BAD_REQUEST, "请填写 API 地址"));
     }
     let url = upstream_models_url(&input.endpoint, &input.protocol)?;
-    let api_key = input.api_key.as_deref().unwrap_or("").trim();
-    let api_key = if api_key.is_empty() {
-        s.upstream_key.as_str()
+    let supplied_key = input
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let stored_key = if supplied_key.is_none() {
+        if let Some(source) = input
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+        {
+            let encrypted = sqlx::query_scalar::<_, String>(
+                "SELECT credential_ciphertext FROM model_routes WHERE source=? AND credential_ciphertext IS NOT NULL ORDER BY created_at LIMIT 1",
+            )
+            .bind(source)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "渠道凭据读取失败"))?;
+            encrypted
+                .map(|value| decrypt_credential(&s.credentials_key, &value))
+                .transpose()
+                .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "渠道凭据解密失败"))?
+        } else {
+            None
+        }
     } else {
-        api_key
+        None
     };
+    let api_key = supplied_key
+        .or(stored_key.as_deref())
+        .unwrap_or(s.upstream_key.as_str());
     if api_key.is_empty() {
         return Err(fail(
             StatusCode::BAD_REQUEST,
