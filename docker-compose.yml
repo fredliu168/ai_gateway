@@ -5,6 +5,7 @@ services:
     env_file: .env
     environment:
       APP_ENV: production
+      TZ: ${TZ:-Asia/Shanghai}
       REDIS_URL: redis://redis:6379/
       AGENT_SANDBOX_URL: http://agent-sandbox:8090
       AGENT_SANDBOX_SECRET: ${AGENT_SANDBOX_SECRET:?Set AGENT_SANDBOX_SECRET in .env}

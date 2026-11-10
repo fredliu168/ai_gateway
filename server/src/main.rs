@@ -31,7 +31,12 @@ use sqlx::{
     FromRow, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
 };
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::HashMap,
+    env,
+    net::SocketAddr,
+    sync::{Arc, Mutex, OnceLock},
+};
 use tower_http::{
     cors::CorsLayer,
     services::{ServeDir, ServeFile},
@@ -68,7 +73,7 @@ async fn execute_agent_sandbox(
     headers: HeaderMap,
     Json(input): Json<AgentSandboxInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let claims = actor(&headers, &s.jwt_secret)?;
+    let claims = actor(&headers, &s).await?;
     if claims.api_key_id.is_some() {
         return Err(fail(StatusCode::FORBIDDEN, "Agent 沙盒需要平台账号登录"));
     }
@@ -131,7 +136,7 @@ async fn agent_chat(
     headers: HeaderMap,
     Json(input): Json<AgentChatInput>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
-    let claims = actor(&headers, &s.jwt_secret)?;
+    let claims = actor(&headers, &s).await?;
     if claims.api_key_id.is_some() {
         return Err(fail(StatusCode::FORBIDDEN, "Agent 模式需要平台账号登录"));
     }
@@ -532,6 +537,7 @@ struct UserRow {
     role: String,
     department_id: Option<String>,
     personal_limit_cents: i64,
+    requests_per_second: i64,
     active: i64,
     used: i64,
 }
@@ -550,6 +556,8 @@ struct UsageRow {
     input_tokens: i64,
     output_tokens: i64,
     cache_tokens: i64,
+    video_duration_seconds: i64,
+    video_resolution: String,
     cost_micros: i64,
     latency_ms: i64,
     error_code: Option<String>,
@@ -571,6 +579,9 @@ struct PriceRow {
     input_image_2k_micros: i64,
     output_image_1k_micros: i64,
     output_image_2k_micros: i64,
+    video_480p_micros_per_second: i64,
+    video_720p_micros_per_second: i64,
+    video_1080p_micros_per_second: i64,
     effective_from: String,
     active: i64,
 }
@@ -635,6 +646,15 @@ struct LimitInput {
     amount_cents: i64,
 }
 #[derive(Deserialize)]
+struct RateLimitInput {
+    requests_per_second: i64,
+}
+#[derive(Deserialize)]
+struct ModelMappingInput {
+    alias_model: String,
+    route_id: String,
+}
+#[derive(Deserialize)]
 struct UserDepartmentInput {
     department_id: String,
 }
@@ -644,10 +664,16 @@ struct UserContactInput {
     email: String,
 }
 #[derive(Deserialize)]
+struct UserRoleInput {
+    role: String,
+}
+#[derive(Deserialize)]
 struct SettingsInput {
     workspace_name: String,
     #[serde(default = "default_time_zone")]
     time_zone: String,
+    #[serde(default = "default_quota_cycle_day")]
+    quota_cycle_day: i64,
     #[serde(default = "default_department_limit_cents")]
     default_department_limit_cents: i64,
     #[serde(default = "default_member_limit_cents")]
@@ -695,6 +721,9 @@ fn default_latency_target_ms() -> i64 {
 fn default_time_zone() -> String {
     "Asia/Shanghai".to_string()
 }
+fn default_quota_cycle_day() -> i64 {
+    1
+}
 #[derive(Deserialize)]
 struct PriceInput {
     model: String,
@@ -710,6 +739,12 @@ struct PriceInput {
     output_image_1k_micros: i64,
     #[serde(default = "default_output_image_price_micros")]
     output_image_2k_micros: i64,
+    #[serde(default = "default_video_price_micros_per_second")]
+    video_480p_micros_per_second: i64,
+    #[serde(default = "default_video_price_micros_per_second")]
+    video_720p_micros_per_second: i64,
+    #[serde(default = "default_video_price_micros_per_second")]
+    video_1080p_micros_per_second: i64,
     effective_from: String,
 }
 fn default_input_image_price_micros() -> i64 {
@@ -717,6 +752,9 @@ fn default_input_image_price_micros() -> i64 {
 }
 fn default_output_image_price_micros() -> i64 {
     180_000
+}
+fn default_video_price_micros_per_second() -> i64 {
+    0
 }
 #[derive(Deserialize)]
 struct ProtocolInput {
@@ -795,19 +833,32 @@ fn decrypt_credential(key: &[u8; 32], encoded: &str) -> anyhow::Result<String> {
     Ok(String::from_utf8(plain)?)
 }
 
-fn actor(headers: &HeaderMap, secret: &str) -> Result<Claims, (StatusCode, Json<Value>)> {
+async fn actor(headers: &HeaderMap, s: &AppState) -> Result<Claims, (StatusCode, Json<Value>)> {
     let token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.strip_prefix("Bearer "))
         .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "请先登录"))?;
-    jsonwebtoken::decode::<Claims>(
+    let decoded = jsonwebtoken::decode::<Claims>(
         token,
-        &jsonwebtoken::DecodingKey::from_secret(secret.as_bytes()),
+        &jsonwebtoken::DecodingKey::from_secret(s.jwt_secret.as_bytes()),
         &jsonwebtoken::Validation::default(),
     )
-    .map(|d| d.claims)
-    .map_err(|_| fail(StatusCode::UNAUTHORIZED, "登录状态无效或已过期"))
+    .map_err(|_| fail(StatusCode::UNAUTHORIZED, "登录状态无效或已过期"))?;
+    let mut claims = decoded.claims;
+    let row = sqlx::query("SELECT role,department_id,active FROM users WHERE id=?")
+        .bind(&claims.sub)
+        .fetch_optional(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "账号权限校验暂不可用"))?
+        .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "账号不存在或已停用"))?;
+    let active: i64 = sqlx::Row::try_get(&row, "active").unwrap_or(0);
+    if active != 1 {
+        return Err(fail(StatusCode::UNAUTHORIZED, "账号不存在或已停用"));
+    }
+    claims.role = sqlx::Row::try_get(&row, "role").unwrap_or_default();
+    claims.department_id = sqlx::Row::try_get(&row, "department_id").unwrap_or(None);
+    Ok(claims)
 }
 async fn api_actor(headers: &HeaderMap, s: &AppState) -> Result<Claims, (StatusCode, Json<Value>)> {
     let bearer = headers
@@ -818,7 +869,9 @@ async fn api_actor(headers: &HeaderMap, s: &AppState) -> Result<Claims, (StatusC
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "请提供平台登录令牌或 API 密钥"))?;
     if !raw.starts_with("lrk_") {
-        return actor(headers, &s.jwt_secret);
+        let claims = actor(headers, s).await?;
+        enforce_user_rate_limit(s, &claims).await?;
+        return Ok(claims);
     }
     let hash = format!("{:x}", Sha256::digest(raw.as_bytes()));
     let row=sqlx::query("SELECT k.id,u.id AS user_id,u.username,u.role,u.department_id FROM api_keys k JOIN users u ON u.id=k.user_id WHERE k.key_hash=? AND k.active=1 AND u.active=1").bind(hash).fetch_optional(&s.db).await.map_err(|_|fail(StatusCode::SERVICE_UNAVAILABLE,"API 密钥校验暂不可用"))?.ok_or_else(||fail(StatusCode::UNAUTHORIZED,"API 密钥无效或已撤销"))?;
@@ -827,14 +880,73 @@ async fn api_actor(headers: &HeaderMap, s: &AppState) -> Result<Claims, (StatusC
     let username: String = sqlx::Row::try_get(&row, "username").unwrap_or_default();
     let role: String = sqlx::Row::try_get(&row, "role").unwrap_or_default();
     let department_id: Option<String> = sqlx::Row::try_get(&row, "department_id").unwrap_or(None);
-    Ok(Claims {
+    let claims = Claims {
         sub: user_id,
         username,
         role,
         department_id,
         api_key_id: Some(id),
         exp: (Utc::now().timestamp() + 12 * 3600) as usize,
-    })
+    };
+    enforce_user_rate_limit(s, &claims).await?;
+    Ok(claims)
+}
+
+static LOCAL_RATE_BUCKETS: OnceLock<Mutex<HashMap<(String, i64), i64>>> = OnceLock::new();
+
+async fn enforce_user_rate_limit(
+    s: &AppState,
+    claims: &Claims,
+) -> Result<(), (StatusCode, Json<Value>)> {
+    let limit: i64 =
+        sqlx::query_scalar("SELECT requests_per_second FROM users WHERE id=? AND active=1")
+            .bind(&claims.sub)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "访问频率配置读取失败"))?
+            .ok_or_else(|| fail(StatusCode::UNAUTHORIZED, "账号已停用"))?;
+    let second = Utc::now().timestamp();
+    let count = if let Some(redis) = &s.redis {
+        let mut connection = redis.clone();
+        let key = format!("llmroute:rps:{}:{second}", claims.sub);
+        let value: redis::RedisResult<i64> = redis::cmd("INCR")
+            .arg(&key)
+            .query_async(&mut connection)
+            .await;
+        match value {
+            Ok(value) => {
+                if value == 1 {
+                    let _: redis::RedisResult<bool> = redis::cmd("EXPIRE")
+                        .arg(&key)
+                        .arg(2)
+                        .query_async(&mut connection)
+                        .await;
+                }
+                value
+            }
+            Err(_) => local_rate_count(&claims.sub, second),
+        }
+    } else {
+        local_rate_count(&claims.sub, second)
+    };
+    if count > limit.max(1) {
+        return Err(fail(
+            StatusCode::TOO_MANY_REQUESTS,
+            "请求过于频繁，请降低请求速率后重试",
+        ));
+    }
+    Ok(())
+}
+
+fn local_rate_count(user_id: &str, second: i64) -> i64 {
+    let buckets = LOCAL_RATE_BUCKETS.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut buckets) = buckets.lock() else {
+        return i64::MAX;
+    };
+    buckets.retain(|(_, window), _| *window >= second - 1);
+    let count = buckets.entry((user_id.to_owned(), second)).or_default();
+    *count += 1;
+    *count
 }
 fn hash_api_key(key: &str) -> String {
     format!("{:x}", Sha256::digest(key.as_bytes()))
@@ -849,8 +961,8 @@ fn resolve_chat_endpoint(endpoint: &str) -> String {
     }
 }
 
-fn admin(headers: &HeaderMap, secret: &str) -> Result<Claims, (StatusCode, Json<Value>)> {
-    let c = actor(headers, secret)?;
+async fn admin(headers: &HeaderMap, s: &AppState) -> Result<Claims, (StatusCode, Json<Value>)> {
+    let c = actor(headers, s).await?;
     if c.role != "platform_admin" {
         return Err(fail(StatusCode::FORBIDDEN, "需要平台管理员权限"));
     }
@@ -861,7 +973,10 @@ async fn get_settings(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
+    let me = actor(&headers, &s).await?;
+    if me.role != "platform_admin" {
+        return Err(fail(StatusCode::FORBIDDEN, "需要平台管理员权限"));
+    }
     let rows = sqlx::query("SELECT key,value FROM app_settings ORDER BY key")
         .fetch_all(&s.db)
         .await
@@ -870,9 +985,7 @@ async fn get_settings(
     for row in rows {
         let key: String = sqlx::Row::try_get(&row, "key").unwrap_or_default();
         let value: String = sqlx::Row::try_get(&row, "value").unwrap_or_default();
-        if key != "email_smtp_password"
-            && (me.role == "platform_admin" || !key.starts_with("email_"))
-        {
+        if key != "email_smtp_password" {
             settings.insert(key, Value::String(value));
         }
     }
@@ -895,7 +1008,7 @@ async fn put_settings(
     headers: HeaderMap,
     Json(input): Json<SettingsInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let admin = admin(&headers, &s.jwt_secret)?;
+    let admin = admin(&headers, &s).await?;
     let name = input.workspace_name.trim();
     let tz = input.time_zone.trim();
     let holiday_dates = input
@@ -907,6 +1020,7 @@ async fn put_settings(
     if name.is_empty()
         || name.chars().count() > 80
         || tz != "Asia/Shanghai"
+        || !(1..=31).contains(&input.quota_cycle_day)
         || input.default_department_limit_cents < 0
         || input.default_department_limit_cents > 100_000_000
         || input.default_member_limit_cents < 0
@@ -939,6 +1053,7 @@ async fn put_settings(
     let values = [
         ("workspace_name", name.to_string()),
         ("time_zone", tz.to_string()),
+        ("quota_cycle_day", input.quota_cycle_day.to_string()),
         (
             "default_department_limit_cents",
             input.default_department_limit_cents.to_string(),
@@ -994,11 +1109,11 @@ async fn put_settings(
         &admin.sub,
         "settings.update",
         "workspace",
-        json!({"workspace_name":name,"time_zone":tz,"default_department_limit_cents":input.default_department_limit_cents,"default_member_limit_cents":input.default_member_limit_cents,"expected_users":input.expected_users,"peak_concurrency":input.peak_concurrency,"target_rps":input.target_rps,"latency_target_ms":input.latency_target_ms,"email_smtp_host":input.email_smtp_host,"email_smtp_port":input.email_smtp_port,"email_smtp_username":input.email_smtp_username,"email_from_address":input.email_from_address,"email_from_name":input.email_from_name,"email_smtp_enabled":input.email_smtp_enabled,"deepseek_holiday_dates":holiday_dates,"email_smtp_password_updated":!input.email_smtp_password.trim().is_empty()}),
+        json!({"workspace_name":name,"time_zone":tz,"quota_cycle_day":input.quota_cycle_day,"default_department_limit_cents":input.default_department_limit_cents,"default_member_limit_cents":input.default_member_limit_cents,"expected_users":input.expected_users,"peak_concurrency":input.peak_concurrency,"target_rps":input.target_rps,"latency_target_ms":input.latency_target_ms,"email_smtp_host":input.email_smtp_host,"email_smtp_port":input.email_smtp_port,"email_smtp_username":input.email_smtp_username,"email_from_address":input.email_from_address,"email_from_name":input.email_from_name,"email_smtp_enabled":input.email_smtp_enabled,"deepseek_holiday_dates":holiday_dates,"email_smtp_password_updated":!input.email_smtp_password.trim().is_empty()}),
     )
     .await;
     Ok(Json(
-        json!({"workspace_name":name,"time_zone":tz,"default_department_limit_cents":input.default_department_limit_cents,"default_member_limit_cents":input.default_member_limit_cents,"expected_users":input.expected_users,"peak_concurrency":input.peak_concurrency,"target_rps":input.target_rps,"latency_target_ms":input.latency_target_ms,"email_smtp_host":input.email_smtp_host,"email_smtp_port":input.email_smtp_port,"email_smtp_username":input.email_smtp_username,"email_from_address":input.email_from_address,"email_from_name":input.email_from_name,"email_smtp_enabled":input.email_smtp_enabled,"deepseek_holiday_dates":holiday_dates,"email_smtp_password_configured":email_password_configured}),
+        json!({"workspace_name":name,"time_zone":tz,"quota_cycle_day":input.quota_cycle_day,"default_department_limit_cents":input.default_department_limit_cents,"default_member_limit_cents":input.default_member_limit_cents,"expected_users":input.expected_users,"peak_concurrency":input.peak_concurrency,"target_rps":input.target_rps,"latency_target_ms":input.latency_target_ms,"email_smtp_host":input.email_smtp_host,"email_smtp_port":input.email_smtp_port,"email_smtp_username":input.email_smtp_username,"email_from_address":input.email_from_address,"email_from_name":input.email_from_name,"email_smtp_enabled":input.email_smtp_enabled,"deepseek_holiday_dates":holiday_dates,"email_smtp_password_configured":email_password_configured}),
     ))
 }
 
@@ -1072,7 +1187,7 @@ async fn test_email_settings(
     headers: HeaderMap,
     Json(input): Json<EmailTestInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let admin = admin(&headers, &s.jwt_secret)?;
+    let admin = admin(&headers, &s).await?;
     let recipient = input.recipient.trim();
     if recipient.parse::<Mailbox>().is_err() {
         return Err(fail(StatusCode::BAD_REQUEST, "请输入有效的收件邮箱"));
@@ -1459,18 +1574,24 @@ async fn dashboard(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
-    let month = Utc::now().format("%Y-%m").to_string();
+    let me = actor(&headers, &s).await?;
+    let (period_start, period_end, _, cycle_day) = billing_window(&s.db, Utc::now()).await;
     let mut summary = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT COUNT(*),COALESCE(SUM(CASE WHEN status='success' THEN cost_micros ELSE 0 END),0),SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END),COALESCE(AVG(CASE WHEN status='success' THEN latency_ms END),0) FROM usage_records WHERE substr(created_at,1,7)=",
+        "SELECT COUNT(*),COALESCE(SUM(CASE WHEN status='success' THEN cost_micros ELSE 0 END),0),COALESCE(SUM(CASE WHEN status!='success' THEN 1 ELSE 0 END),0),CAST(COALESCE(AVG(CASE WHEN status='success' THEN latency_ms END),0) AS REAL) FROM usage_records WHERE created_at>=",
     );
-    summary.push_bind(&month);
+    summary
+        .push_bind(&period_start)
+        .push(" AND created_at<")
+        .push_bind(&period_end);
     apply_usage_scope(&mut summary, &me);
     let (calls, spend, errors, average_latency): (i64, i64, i64, f64) = summary
         .build_query_as()
         .fetch_one(&s.db)
         .await
-        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "统计数据读取失败"))?;
+        .map_err(|error| {
+            tracing::error!(%error, "dashboard summary query failed");
+            fail(StatusCode::INTERNAL_SERVER_ERROR, "统计数据读取失败")
+        })?;
     let (departments, users): (i64, i64) = if me.role == "platform_admin" {
         (
             sqlx::query_scalar("SELECT COUNT(*) FROM departments")
@@ -1504,10 +1625,19 @@ async fn dashboard(
         .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "部门查询失败"))?;
     let mut dep_view = Vec::new();
     for d in dep_rows {
+        if me.role == "user" {
+            continue;
+        }
         if me.role != "platform_admin" && me.department_id.as_deref() != Some(d.id.as_str()) {
             continue;
         }
-        let used:i64=sqlx::query_scalar("SELECT COALESCE(SUM(cost_micros),0) FROM usage_records WHERE department_id=? AND substr(created_at,1,7)=? AND status='success'").bind(&d.id).bind(&month).fetch_one(&s.db).await.unwrap_or(0);
+        let used = if me.role == "department_admin" {
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(amount_micros),0) FROM quota_ledger WHERE department_id=? AND entry_type='charge' AND created_at>=? AND created_at<?")
+                .bind(&d.id).bind(&period_start).bind(&period_end).fetch_one(&s.db).await.unwrap_or(0)
+        } else {
+            sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(cost_micros),0) FROM usage_records WHERE department_id=? AND created_at>=? AND created_at<? AND status='success'")
+                .bind(&d.id).bind(&period_start).bind(&period_end).fetch_one(&s.db).await.unwrap_or(0)
+        };
         let member_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE department_id=? AND active=1")
                 .bind(&d.id)
@@ -1532,9 +1662,13 @@ async fn dashboard(
         .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "费用趋势读取失败"))?;
     let trend:Vec<Value>=trend_rows.iter().map(|r|json!({"day":sqlx::Row::try_get::<String,_>(r,"day").unwrap_or_default(),"spend_micros":sqlx::Row::try_get::<i64,_>(r,"spend_micros").unwrap_or(0),"calls":sqlx::Row::try_get::<i64,_>(r,"calls").unwrap_or(0)})).collect();
     let mut model_query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT model,COALESCE(SUM(cost_micros),0) AS spend_micros,COUNT(*) AS calls FROM usage_records WHERE substr(created_at,1,7)=",
+        "SELECT model,COALESCE(SUM(cost_micros),0) AS spend_micros,COUNT(*) AS calls FROM usage_records WHERE created_at>=",
     );
-    model_query.push_bind(&month).push(" AND status='success'");
+    model_query
+        .push_bind(&period_start)
+        .push(" AND created_at<")
+        .push_bind(&period_end)
+        .push(" AND status='success'");
     apply_usage_scope(&mut model_query, &me);
     model_query.push(" GROUP BY model ORDER BY spend_micros DESC");
     let model_rows = model_query
@@ -1543,8 +1677,17 @@ async fn dashboard(
         .await
         .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型统计读取失败"))?;
     let model_usage:Vec<Value>=model_rows.iter().map(|r|json!({"model":sqlx::Row::try_get::<String,_>(r,"model").unwrap_or_default(),"spend_micros":sqlx::Row::try_get::<i64,_>(r,"spend_micros").unwrap_or(0),"calls":sqlx::Row::try_get::<i64,_>(r,"calls").unwrap_or(0)})).collect();
+    let personal_limit_cents: Option<i64> = if me.role == "user" {
+        sqlx::query_scalar("SELECT personal_limit_cents FROM users WHERE id=?")
+            .bind(&me.sub)
+            .fetch_optional(&s.db)
+            .await
+            .unwrap_or(None)
+    } else {
+        None
+    };
     Ok(Json(
-        json!({"month":month,"department_count":departments,"user_count":users,"call_count":calls,"spend_micros":spend,"error_count":errors,"average_latency_ms":average_latency,"departments":dep_view,"trend":trend,"model_usage":model_usage}),
+        json!({"month":period_start,"quota_cycle_day":cycle_day,"department_count":if me.role == "user" {0} else {departments},"user_count":if me.role == "user" {1} else {users},"personal_limit_cents":personal_limit_cents,"call_count":calls,"spend_micros":spend,"error_count":errors,"average_latency_ms":average_latency,"departments":dep_view,"trend":trend,"model_usage":model_usage}),
     ))
 }
 
@@ -1552,18 +1695,21 @@ async fn departments(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Value>>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
+    let me = actor(&headers, &s).await?;
     let rows = sqlx::query_as::<_, Department>("SELECT * FROM departments ORDER BY name")
         .fetch_all(&s.db)
         .await
         .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "部门查询失败"))?;
-    let month = Utc::now().format("%Y-%m").to_string();
+    if me.role == "user" {
+        return Ok(Json(Vec::new()));
+    }
+    let (period_start, period_end, _, _) = billing_window(&s.db, Utc::now()).await;
     let mut out = Vec::new();
     for d in rows {
         if me.role != "platform_admin" && me.department_id.as_deref() != Some(d.id.as_str()) {
             continue;
         }
-        let used:i64=sqlx::query_scalar("SELECT COALESCE(SUM(cost_micros),0) FROM usage_records WHERE department_id=? AND substr(created_at,1,7)=? AND status='success'").bind(&d.id).bind(&month).fetch_one(&s.db).await.unwrap_or(0);
+        let used:i64=sqlx::query_scalar("SELECT COALESCE(SUM(cost_micros),0) FROM usage_records WHERE department_id=? AND created_at>=? AND created_at<? AND status='success'").bind(&d.id).bind(&period_start).bind(&period_end).fetch_one(&s.db).await.unwrap_or(0);
         let member_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE department_id=? AND active=1")
                 .bind(&d.id)
@@ -1580,7 +1726,7 @@ async fn add_department(
     headers: HeaderMap,
     Json(i): Json<DepartmentInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    let a = admin(&headers, &s.jwt_secret)?;
+    let a = admin(&headers, &s).await?;
     if i.name.trim().is_empty() || i.monthly_limit_cents < 0 || i.member_limit_cap_cents < 0 {
         return Err(fail(StatusCode::BAD_REQUEST, "请检查部门名称和额度"));
     }
@@ -1602,7 +1748,7 @@ async fn update_department(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(i): Json<DepartmentInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let a = admin(&headers, &s.jwt_secret)?;
+    let a = admin(&headers, &s).await?;
     if i.name.trim().is_empty() || i.monthly_limit_cents < 0 || i.member_limit_cap_cents < 0 {
         return Err(fail(StatusCode::BAD_REQUEST, "请检查部门名称和额度"));
     }
@@ -1632,27 +1778,17 @@ async fn users(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<UserRow>>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
-    let month = Utc::now().format("%Y-%m").to_string();
-    let rows=sqlx::query_as::<_,UserRow>("SELECT u.id,u.username,u.display_name,u.phone,u.email,u.role,u.department_id,u.personal_limit_cents,u.active,COALESCE((SELECT SUM(r.cost_micros) FROM usage_records r WHERE r.user_id=u.id AND r.status='success' AND substr(r.created_at,1,7)=?),0) AS used FROM users u ORDER BY u.display_name").bind(&month).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"用户查询失败"))?;
-    if me.role == "platform_admin" {
-        Ok(Json(rows))
-    } else if me.role == "department_admin" {
-        Ok(Json(
-            rows.into_iter()
-                .filter(|u| u.department_id == me.department_id || u.id == me.sub)
-                .collect(),
-        ))
-    } else {
-        Ok(Json(rows.into_iter().filter(|u| u.id == me.sub).collect()))
-    }
+    let me = actor(&headers, &s).await?;
+    let (period_start, period_end, _, _) = billing_window(&s.db, Utc::now()).await;
+    let rows=sqlx::query_as::<_,UserRow>("SELECT u.id,u.username,u.display_name,u.phone,u.email,u.role,u.department_id,u.personal_limit_cents,u.requests_per_second,u.active,COALESCE((SELECT SUM(r.cost_micros) FROM usage_records r WHERE r.user_id=u.id AND r.status='success' AND r.created_at>=? AND r.created_at<?),0) AS used FROM users u WHERE (?='platform_admin' OR (?='department_admin' AND u.department_id=?) OR u.id=?) ORDER BY u.display_name").bind(&period_start).bind(&period_end).bind(&me.role).bind(&me.role).bind(&me.department_id).bind(&me.sub).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"用户查询失败"))?;
+    Ok(Json(rows))
 }
 async fn add_user(
     State(s): State<AppState>,
     headers: HeaderMap,
     Json(i): Json<UserInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    let a = admin(&headers, &s.jwt_secret)?;
+    let a = admin(&headers, &s).await?;
     if !["department_admin", "user"].contains(&i.role.as_str())
         || i.personal_limit_cents < 0
         || i.username.trim().is_empty()
@@ -1709,7 +1845,7 @@ async fn add_users_batch(
     headers: HeaderMap,
     Json(input): Json<BatchUsersInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let admin = admin(&headers, &s.jwt_secret)?;
+    let admin = admin(&headers, &s).await?;
     if input.users.is_empty() || input.users.len() > 500 {
         return Err(fail(
             StatusCode::BAD_REQUEST,
@@ -1808,7 +1944,7 @@ async fn set_user_limit(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(i): Json<LimitInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let a = actor(&headers, &s.jwt_secret)?;
+    let a = actor(&headers, &s).await?;
     if i.amount_cents < 0 {
         return Err(fail(StatusCode::BAD_REQUEST, "额度不能为负数"));
     }
@@ -1820,6 +1956,9 @@ async fn set_user_limit(
         .ok_or_else(|| fail(StatusCode::NOT_FOUND, "用户不存在"))?;
     let dep: Option<String> = sqlx::Row::try_get(&u, "department_id").unwrap_or(None);
     if a.role == "department_admin" {
+        if dep.as_deref().is_none() || dep.as_deref() == a.department_id.as_deref() && id == a.sub {
+            return Err(fail(StatusCode::FORBIDDEN, "只能调整本部门其他成员额度"));
+        }
         if dep != a.department_id {
             return Err(fail(StatusCode::FORBIDDEN, "只能调整本部门成员"));
         }
@@ -1856,13 +1995,48 @@ async fn set_user_limit(
     .await;
     Ok(Json(json!({"ok":true})))
 }
+
+async fn set_user_rate_limit(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<RateLimitInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = admin(&headers, &s).await?;
+    if !(1..=1000).contains(&input.requests_per_second) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "访问频率必须在 1 到 1000 次/秒之间",
+        ));
+    }
+    let result = sqlx::query("UPDATE users SET requests_per_second=? WHERE id=?")
+        .bind(input.requests_per_second)
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "访问频率更新失败"))?;
+    if result.rows_affected() == 0 {
+        return Err(fail(StatusCode::NOT_FOUND, "用户不存在"));
+    }
+    audit(
+        &s.db,
+        &admin.sub,
+        "user.rate_limit.update",
+        &id,
+        json!({"requests_per_second":input.requests_per_second}),
+    )
+    .await;
+    Ok(Json(
+        json!({"ok":true,"requests_per_second":input.requests_per_second}),
+    ))
+}
 async fn set_user_department(
     State(s): State<AppState>,
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(input): Json<UserDepartmentInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let admin = admin(&headers, &s.jwt_secret)?;
+    let admin = admin(&headers, &s).await?;
     let department_id = input.department_id.trim();
     let user = sqlx::query("SELECT department_id,personal_limit_cents,role FROM users WHERE id=?")
         .bind(&id)
@@ -1911,7 +2085,7 @@ async fn update_user_contact(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(input): Json<UserContactInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let admin = admin(&headers, &s.jwt_secret)?;
+    let admin = admin(&headers, &s).await?;
     let phone = input.phone.trim();
     let email = input.email.trim().to_ascii_lowercase();
     if phone.chars().count() > 24
@@ -1948,12 +2122,61 @@ async fn update_user_contact(
     Ok(Json(json!({"ok":true})))
 }
 
+async fn update_user_role(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(input): Json<UserRoleInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = admin(&headers, &s).await?;
+    if !["user", "department_admin"].contains(&input.role.as_str()) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "仅支持普通用户和部门管理员角色",
+        ));
+    }
+    let row = sqlx::query("SELECT role,department_id FROM users WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "成员查询失败"))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "成员不存在"))?;
+    let old_role: String = sqlx::Row::try_get(&row, "role").unwrap_or_default();
+    let department_id: Option<String> = sqlx::Row::try_get(&row, "department_id").unwrap_or(None);
+    if !["user", "department_admin"].contains(&old_role.as_str()) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "不能修改系统管理员账号的角色",
+        ));
+    }
+    if input.role == "department_admin" && department_id.as_deref().unwrap_or("").is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "请先为该成员分配部门"));
+    }
+    sqlx::query("UPDATE users SET role=? WHERE id=? AND role IN ('user','department_admin')")
+        .bind(&input.role)
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "成员权限更新失败"))?;
+    audit(
+        &s.db,
+        &admin.sub,
+        "user.role.update",
+        &id,
+        json!({"before_role":old_role,"after_role":input.role,"department_id":department_id}),
+    )
+    .await;
+    Ok(Json(
+        json!({"ok":true,"role":input.role,"department_id":department_id}),
+    ))
+}
+
 async fn list_api_keys(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<Value>>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
-    let (month_start, month_end, _) = billing_window(Utc::now());
+    let me = actor(&headers, &s).await?;
+    let (month_start, month_end, _, _) = billing_window(&s.db, Utc::now()).await;
     let rows=sqlx::query("SELECT k.id,k.name,k.key_prefix,k.monthly_limit_cents,k.active,k.created_at,COALESCE((SELECT MAX(ur.created_at) FROM usage_records ur WHERE ur.api_key_id=k.id),k.last_used_at) AS last_used_at,COALESCE(SUM(CASE WHEN r.status='success' THEN r.cost_micros ELSE 0 END),0) AS used_micros,COUNT(r.id) AS call_count,COALESCE(SUM(r.input_tokens),0) AS input_tokens,COALESCE(SUM(r.output_tokens),0) AS output_tokens FROM api_keys k LEFT JOIN usage_records r ON r.api_key_id=k.id AND r.created_at>=? AND r.created_at<? WHERE k.user_id=? GROUP BY k.id ORDER BY k.created_at DESC").bind(month_start).bind(month_end).bind(&me.sub).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"API 密钥查询失败"))?;
     Ok(Json(rows.iter().map(|r|json!({"id":sqlx::Row::try_get::<String,_>(r,"id").unwrap_or_default(),"name":sqlx::Row::try_get::<String,_>(r,"name").unwrap_or_default(),"key_prefix":sqlx::Row::try_get::<String,_>(r,"key_prefix").unwrap_or_default(),"monthly_limit_cents":sqlx::Row::try_get::<i64,_>(r,"monthly_limit_cents").unwrap_or(0),"active":sqlx::Row::try_get::<i64,_>(r,"active").unwrap_or(0),"created_at":sqlx::Row::try_get::<String,_>(r,"created_at").unwrap_or_default(),"last_used_at":sqlx::Row::try_get::<Option<String>,_>(r,"last_used_at").unwrap_or(None),"used_micros":sqlx::Row::try_get::<i64,_>(r,"used_micros").unwrap_or(0),"call_count":sqlx::Row::try_get::<i64,_>(r,"call_count").unwrap_or(0),"input_tokens":sqlx::Row::try_get::<i64,_>(r,"input_tokens").unwrap_or(0),"output_tokens":sqlx::Row::try_get::<i64,_>(r,"output_tokens").unwrap_or(0)})).collect()))
 }
@@ -1962,7 +2185,7 @@ async fn create_api_key(
     headers: HeaderMap,
     Json(input): Json<ApiKeyInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
+    let me = actor(&headers, &s).await?;
     let name = input.name.trim();
     if name.is_empty() || name.chars().count() > 80 || input.monthly_limit_cents <= 0 {
         return Err(fail(
@@ -2038,7 +2261,7 @@ async fn revoke_api_key(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
+    let me = actor(&headers, &s).await?;
     let result = sqlx::query("UPDATE api_keys SET active=0 WHERE id=? AND user_id=? AND active=1")
         .bind(&id)
         .bind(&me.sub)
@@ -2056,7 +2279,7 @@ async fn api_key_stats(
     headers: HeaderMap,
     axum::extract::Path(id): axum::extract::Path<String>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
+    let me = actor(&headers, &s).await?;
     let owns: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE id=? AND user_id=?")
         .bind(&id)
         .bind(&me.sub)
@@ -2066,7 +2289,7 @@ async fn api_key_stats(
     if owns == 0 {
         return Err(fail(StatusCode::NOT_FOUND, "API 密钥不存在"));
     }
-    let (month_start, month_end, _) = billing_window(Utc::now());
+    let (month_start, month_end, _, _) = billing_window(&s.db, Utc::now()).await;
     let rows=sqlx::query("SELECT model,COUNT(*) AS calls,COALESCE(SUM(input_tokens),0) AS input_tokens,COALESCE(SUM(output_tokens),0) AS output_tokens,COALESCE(SUM(cache_tokens),0) AS cache_tokens,COALESCE(SUM(cost_micros),0) AS cost_micros FROM usage_records WHERE api_key_id=? AND created_at>=? AND created_at<? GROUP BY model ORDER BY cost_micros DESC").bind(&id).bind(month_start).bind(month_end).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"密钥调用统计查询失败"))?;
     Ok(Json(Value::Array(rows.iter().map(|r|json!({"model":sqlx::Row::try_get::<String,_>(r,"model").unwrap_or_default(),"calls":sqlx::Row::try_get::<i64,_>(r,"calls").unwrap_or(0),"input_tokens":sqlx::Row::try_get::<i64,_>(r,"input_tokens").unwrap_or(0),"output_tokens":sqlx::Row::try_get::<i64,_>(r,"output_tokens").unwrap_or(0),"cache_tokens":sqlx::Row::try_get::<i64,_>(r,"cache_tokens").unwrap_or(0),"cost_micros":sqlx::Row::try_get::<i64,_>(r,"cost_micros").unwrap_or(0)})).collect())))
 }
@@ -2076,8 +2299,8 @@ async fn usage(
     headers: HeaderMap,
     Query(f): Query<UsageFilter>,
 ) -> Result<Json<Vec<UsageRow>>, (StatusCode, Json<Value>)> {
-    let me = actor(&headers, &s.jwt_secret)?;
-    let rows=sqlx::query_as::<_,UsageRow>("SELECT r.id,r.request_id,u.username,u.display_name,d.name AS department_name,r.model,r.protocol,r.mode,r.status,r.input_tokens,r.output_tokens,r.cache_tokens,r.cost_micros,r.latency_ms,r.error_code,r.created_at FROM usage_records r JOIN users u ON u.id=r.user_id LEFT JOIN departments d ON d.id=r.department_id WHERE (? IS NULL OR r.department_id=?) AND (? IS NULL OR r.status=?) AND (? IS NULL OR r.model=?) AND (? IS NULL OR r.created_at>=?) AND (? IS NULL OR r.created_at<=?) ORDER BY r.created_at DESC LIMIT 500")
+    let me = actor(&headers, &s).await?;
+    let rows=sqlx::query_as::<_,UsageRow>("SELECT r.id,r.request_id,u.username,u.display_name,d.name AS department_name,r.model,r.protocol,r.mode,r.status,r.input_tokens,r.output_tokens,r.cache_tokens,r.video_duration_seconds,r.video_resolution,r.cost_micros,r.latency_ms,r.error_code,r.created_at FROM usage_records r JOIN users u ON u.id=r.user_id LEFT JOIN departments d ON d.id=r.department_id WHERE (? IS NULL OR r.department_id=?) AND (? IS NULL OR r.status=?) AND (? IS NULL OR r.model=?) AND (? IS NULL OR r.created_at>=?) AND (? IS NULL OR r.created_at<=?) ORDER BY r.created_at DESC LIMIT 500")
         .bind(if me.role=="department_admin" {me.department_id.clone()}else{f.department_id.clone()}).bind(if me.role=="department_admin" {me.department_id.clone()}else{f.department_id.clone()}).bind(&f.status).bind(&f.status).bind(&f.model).bind(&f.model).bind(&f.from).bind(&f.from).bind(&f.to).bind(&f.to).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"调用记录查询失败"))?;
     if me.role == "platform_admin" {
         Ok(Json(rows))
@@ -2092,22 +2315,44 @@ async fn usage(
     }
 }
 
-fn billing_window(now: chrono::DateTime<Utc>) -> (String, String, bool) {
+async fn billing_window(
+    db: &SqlitePool,
+    now: chrono::DateTime<Utc>,
+) -> (String, String, bool, i64) {
+    let cycle_day: i64 = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM app_settings WHERE key='quota_cycle_day'",
+    )
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|v| v.parse().ok())
+    .unwrap_or(1)
+    .clamp(1, 31);
     let local = now.with_timezone(&Shanghai);
-    let local_start = Shanghai
-        .with_ymd_and_hms(local.year(), local.month(), 1, 0, 0, 0)
-        .single()
-        .expect("valid local month start");
-    let next = if local.month() == 12 {
+    let month_start = |year: i32, month: u32| {
+        let day = (1..=cycle_day as u32)
+            .rev()
+            .find(|d| chrono::NaiveDate::from_ymd_opt(year, month, *d).is_some())
+            .unwrap_or(1);
         Shanghai
-            .with_ymd_and_hms(local.year() + 1, 1, 1, 0, 0, 0)
+            .with_ymd_and_hms(year, month, day, 0, 0, 0)
             .single()
-            .unwrap()
+            .expect("valid quota cycle start")
+    };
+    let (this_year, this_month) = (local.year(), local.month());
+    let this_start = month_start(this_year, this_month);
+    let local_start = if local >= this_start {
+        this_start
+    } else if this_month == 1 {
+        month_start(this_year - 1, 12)
     } else {
-        Shanghai
-            .with_ymd_and_hms(local.year(), local.month() + 1, 1, 0, 0, 0)
-            .single()
-            .unwrap()
+        month_start(this_year, this_month - 1)
+    };
+    let next = if local_start.month() == 12 {
+        month_start(local_start.year() + 1, 1)
+    } else {
+        month_start(local_start.year(), local_start.month() + 1)
     };
     (
         local_start
@@ -2118,6 +2363,7 @@ fn billing_window(now: chrono::DateTime<Utc>) -> (String, String, bool) {
             .format("%Y-%m-%d %H:%M:%S")
             .to_string(),
         local.hour() < 8,
+        cycle_day,
     )
 }
 
@@ -2138,7 +2384,8 @@ async fn offpeak_for_model(
     legacy_night: bool,
 ) -> bool {
     let source =
-        sqlx::query_scalar::<_, String>("SELECT source FROM model_routes WHERE model_key=?")
+        sqlx::query_scalar::<_, String>("SELECT source FROM model_routes WHERE model_key=? UNION ALL SELECT r.source FROM model_mappings m JOIN model_routes r ON r.id=m.route_id WHERE m.alias_model=? AND m.enabled=1 LIMIT 1")
+            .bind(model)
             .bind(model)
             .fetch_optional(db)
             .await
@@ -2271,6 +2518,16 @@ async fn record_failed_call(
         .bind(Uuid::new_v4().to_string()).bind(request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(model).bind(protocol).bind(mode).bind(price_id).bind(latency).bind(error).execute(&s.db).await;
 }
 
+async fn resolve_model_route(
+    s: &AppState,
+    requested_model: &str,
+) -> Result<sqlx::sqlite::SqliteRow, (StatusCode, Json<Value>)> {
+    sqlx::query("SELECT r.id,r.model_key,r.upstream_model,r.protocol,r.endpoint,r.billing_mode,r.enabled,r.credential_ciphertext FROM model_routes r LEFT JOIN model_mappings m ON m.route_id=r.id AND m.alias_model=? AND m.enabled=1 WHERE (m.alias_model IS NOT NULL OR r.model_key=?) AND (m.alias_model IS NOT NULL OR NOT EXISTS(SELECT 1 FROM model_mappings WHERE alias_model=? AND enabled=1)) AND r.enabled=1 ORDER BY CASE WHEN m.alias_model IS NOT NULL THEN 0 ELSE 1 END LIMIT 1")
+        .bind(requested_model).bind(requested_model).bind(requested_model).fetch_optional(&s.db).await
+        .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE,"模型路由读取失败"))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND,"请求的模型未配置或未启用"))
+}
+
 async fn openai_chat(
     State(s): State<AppState>,
     headers: HeaderMap,
@@ -2284,7 +2541,7 @@ async fn openai_chat(
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "请求缺少 model 字段"))?;
-    let route=sqlx::query("SELECT id,model_key,upstream_model,protocol,endpoint,billing_mode,enabled,credential_ciphertext FROM model_routes WHERE model_key=?").bind(requested_model).fetch_optional(&s.db).await.map_err(|_|fail(StatusCode::SERVICE_UNAVAILABLE,"模型路由读取失败"))?.ok_or_else(||fail(StatusCode::NOT_FOUND,"请求的模型未配置"))?;
+    let route = resolve_model_route(&s, requested_model).await?;
     let model_key: String = sqlx::Row::try_get(&route, "model_key").unwrap_or_default();
     let upstream_model: String = sqlx::Row::try_get(&route, "upstream_model").unwrap_or_default();
     let protocol: String = sqlx::Row::try_get(&route, "protocol").unwrap_or_default();
@@ -2318,7 +2575,7 @@ async fn openai_chat(
         None => s.upstream_key.as_str().to_string(),
     };
     let now = Utc::now();
-    let (window_start, window_end, legacy_night) = billing_window(now);
+    let (window_start, window_end, legacy_night, _) = billing_window(&s.db, now).await;
     let is_night = offpeak_for_model(&s.db, &model_key, now, legacy_night).await;
     let price=sqlx::query_as::<_,PriceRow>("SELECT * FROM model_prices WHERE model=? AND mode=? AND active=1 AND julianday(effective_from)<=julianday(?) ORDER BY julianday(effective_from) DESC LIMIT 1").bind(&model_key).bind(&mode).bind(now.to_rfc3339()).fetch_optional(&s.db).await.map_err(|_|fail(StatusCode::SERVICE_UNAVAILABLE,"计价配置读取失败"))?.ok_or_else(||fail(StatusCode::SERVICE_UNAVAILABLE,"该模型尚未配置有效价格"))?;
     let max_tokens = body
@@ -2467,8 +2724,7 @@ async fn openai_image_generation(
         .get("model")
         .and_then(Value::as_str)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "请求缺少 model 字段"))?;
-    let route = sqlx::query("SELECT model_key,upstream_model,protocol,endpoint,billing_mode,enabled,credential_ciphertext FROM model_routes WHERE model_key=?")
-        .bind(requested_model).fetch_optional(&s.db).await.map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE,"模型路由读取失败"))?.ok_or_else(|| fail(StatusCode::NOT_FOUND,"请求的模型未配置"))?;
+    let route = resolve_model_route(&s, requested_model).await?;
     let model_key: String = sqlx::Row::try_get(&route, "model_key").unwrap_or_default();
     let upstream_model: String = sqlx::Row::try_get(&route, "upstream_model").unwrap_or_default();
     let protocol: String = sqlx::Row::try_get(&route, "protocol").unwrap_or_default();
@@ -2498,7 +2754,7 @@ async fn openai_image_generation(
         None => s.upstream_key.as_str().to_string(),
     };
     let now = Utc::now();
-    let (window_start, window_end, legacy_night) = billing_window(now);
+    let (window_start, window_end, legacy_night, _) = billing_window(&s.db, now).await;
     let is_night = offpeak_for_model(&s.db, &model_key, now, legacy_night).await;
     let price=sqlx::query_as::<_,PriceRow>("SELECT * FROM model_prices WHERE model=? AND mode=? AND active=1 AND julianday(effective_from)<=julianday(?) ORDER BY julianday(effective_from) DESC LIMIT 1").bind(&model_key).bind(&mode).bind(now.to_rfc3339()).fetch_optional(&s.db).await.map_err(|_|fail(StatusCode::SERVICE_UNAVAILABLE,"计价配置读取失败"))?.ok_or_else(||fail(StatusCode::SERVICE_UNAVAILABLE,"该模型尚未配置有效价格"))?;
     let estimate = (body.to_string().len() as i64).max(1);
@@ -2823,6 +3079,292 @@ async fn dashscope_generation(
     protocol_chat(State(s), headers, Json(body), "dashscope").await
 }
 
+const DASHSCOPE_VIDEO_PATH: &str = "/services/aigc/video-generation/video-synthesis";
+
+fn video_resolution_price(price: &PriceRow, size: &str) -> Option<(&'static str, i64)> {
+    match size.trim().replace(' ', "").as_str() {
+        "1920*1080" | "1080p" | "1080P" => Some(("1080P", price.video_1080p_micros_per_second)),
+        "1280*720" | "720p" | "720P" => Some(("720P", price.video_720p_micros_per_second)),
+        "832*480" | "854*480" | "480p" | "480P" => {
+            Some(("480P", price.video_480p_micros_per_second))
+        }
+        _ => None,
+    }
+}
+
+async fn dashscope_video_generation(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> Result<Response, (StatusCode, Json<Value>)> {
+    let claims = api_actor(&headers, &s).await?;
+    let requested_model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "请求缺少 model 字段"))?
+        .to_string();
+    let prompt = body
+        .pointer("input.prompt")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if prompt.is_empty() {
+        return Err(fail(StatusCode::BAD_REQUEST, "请求缺少 input.prompt"));
+    }
+    let duration = body
+        .pointer("parameters.duration")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "parameters.duration 必须为整数"))?;
+    if !(1..=30).contains(&duration) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "视频时长必须在 1 到 30 秒之间",
+        ));
+    }
+    let size = body
+        .pointer("parameters.size")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            fail(
+                StatusCode::BAD_REQUEST,
+                "parameters.size 必须是 1920*1080、1280*720 或 832*480",
+            )
+        })?;
+
+    let route = resolve_model_route(&s, &requested_model).await?;
+    let protocol: String = sqlx::Row::try_get(&route, "protocol").unwrap_or_default();
+    let endpoint: String = sqlx::Row::try_get(&route, "endpoint").unwrap_or_default();
+    let mode: String = sqlx::Row::try_get(&route, "billing_mode").unwrap_or_default();
+    let enabled: i64 = sqlx::Row::try_get(&route, "enabled").unwrap_or(0);
+    let encrypted_key: Option<String> =
+        sqlx::Row::try_get(&route, "credential_ciphertext").unwrap_or(None);
+    let upstream_model: String = sqlx::Row::try_get(&route, "upstream_model").unwrap_or_default();
+    if enabled == 0 {
+        return Err(fail(StatusCode::NOT_FOUND, "该模型当前已停用"));
+    }
+    if protocol != "dashscope" || mode != "pay_as_you_go" {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "视频生成要求启用按量计费的 DashScope 模型",
+        ));
+    }
+    if !endpoint.ends_with(DASHSCOPE_VIDEO_PATH) {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "模型渠道地址必须指向 DashScope video-synthesis 接口",
+        ));
+    }
+    let now = Utc::now();
+    let (window_start, window_end, _, _) = billing_window(&s.db, now).await;
+    let price = sqlx::query_as::<_, PriceRow>("SELECT * FROM model_prices WHERE model=? AND mode=? AND active=1 AND julianday(effective_from)<=julianday(?) ORDER BY julianday(effective_from) DESC LIMIT 1")
+        .bind(&requested_model).bind(&mode).bind(now.to_rfc3339()).fetch_optional(&s.db).await
+        .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频价格读取失败"))?
+        .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "该模型尚未配置有效价格"))?;
+    let (resolution, rate) = video_resolution_price(&price, size)
+        .filter(|(_, rate)| *rate > 0)
+        .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "该分辨率没有配置有效视频价格"))?;
+    let reserved = rate.saturating_mul(duration);
+    let credential = match encrypted_key.as_deref() {
+        Some(k) => decrypt_credential(&s.credentials_key, k)
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "模型密钥无法解密"))?,
+        None => s.upstream_key.as_str().to_string(),
+    };
+    let request_id = Uuid::new_v4().to_string();
+    reserve_quota(
+        &s,
+        &claims,
+        &request_id,
+        reserved,
+        &window_start,
+        &window_end,
+    )
+    .await?;
+    body["model"] = json!(upstream_model);
+    let upstream = match s
+        .http
+        .post(&endpoint)
+        .bearer_auth(&credential)
+        .header("X-DashScope-Async", "enable")
+        .json(&body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => {
+            close_reservation(&s, &claims, &request_id, reserved, 0, true).await;
+            return Err(fail(StatusCode::BAD_GATEWAY, "视频模型上游连接失败"));
+        }
+    };
+    let upstream_status = upstream.status();
+    let bytes = upstream.bytes().await.unwrap_or_default();
+    if !upstream_status.is_success() {
+        close_reservation(&s, &claims, &request_id, reserved, 0, true).await;
+        return Ok((
+            upstream_status,
+            [(header::CONTENT_TYPE, "application/json")],
+            bytes,
+        )
+            .into_response());
+    }
+    let mut response: Value = match serde_json::from_slice(&bytes) {
+        Ok(response) => response,
+        Err(_) => {
+            close_reservation(&s, &claims, &request_id, reserved, 0, true).await;
+            return Err(fail(
+                StatusCode::BAD_GATEWAY,
+                "视频模型返回了无法解析的响应",
+            ));
+        }
+    };
+    let upstream_task_id = response
+        .get("task_id")
+        .and_then(Value::as_str)
+        .or_else(|| response.pointer("output.task_id").and_then(Value::as_str))
+        .filter(|id| !id.is_empty())
+        .map(str::to_string);
+    let Some(upstream_task_id) = upstream_task_id else {
+        close_reservation(&s, &claims, &request_id, reserved, 0, true).await;
+        return Err(fail(StatusCode::BAD_GATEWAY, "视频服务未返回 task_id"));
+    };
+    let public_task_id = Uuid::new_v4().to_string();
+    let task_status = response
+        .pointer("output.task_status")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("task_status").and_then(Value::as_str))
+        .unwrap_or("PENDING")
+        .to_string();
+    response["task_id"] = json!(public_task_id);
+    response["request_id"] = json!(request_id);
+    let saved_response = serde_json::to_string(&response).unwrap_or_else(|_| "{}".into());
+    let insert = sqlx::query("INSERT INTO video_tasks(task_id,request_id,upstream_task_id,user_id,department_id,api_key_id,model,upstream_endpoint,credential_ciphertext,duration_seconds,resolution,rate_micros_per_second,reserved_micros,price_id,task_status,response_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&public_task_id).bind(&request_id).bind(&upstream_task_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id)
+        .bind(&requested_model).bind(&endpoint).bind(encrypted_key).bind(duration).bind(resolution).bind(rate).bind(reserved).bind(&price.id).bind(&task_status).bind(&saved_response)
+        .execute(&s.db).await;
+    if insert.is_err() {
+        close_reservation(&s, &claims, &request_id, reserved, 0, true).await;
+        return Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "视频任务保存失败，请联系管理员",
+        ));
+    }
+    Ok((StatusCode::OK, Json(response)).into_response())
+}
+
+async fn dashscope_video_task_status(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(task_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let claims = api_actor(&headers, &s).await?;
+    let row = sqlx::query("SELECT request_id,user_id,department_id,api_key_id,model,upstream_task_id,upstream_endpoint,credential_ciphertext,duration_seconds,resolution,rate_micros_per_second,reserved_micros,price_id,task_status,settled,response_json FROM video_tasks WHERE task_id=? AND user_id=? AND api_key_id IS ?")
+        .bind(&task_id).bind(&claims.sub).bind(&claims.api_key_id).fetch_optional(&s.db).await
+        .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频任务读取失败"))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "视频任务不存在"))?;
+    let request_id: String = sqlx::Row::try_get(&row, "request_id").unwrap_or_default();
+    let task_user_id: String = sqlx::Row::try_get(&row, "user_id").unwrap_or_default();
+    let task_department_id: Option<String> =
+        sqlx::Row::try_get(&row, "department_id").unwrap_or(None);
+    let task_api_key_id: Option<String> = sqlx::Row::try_get(&row, "api_key_id").unwrap_or(None);
+    let model: String = sqlx::Row::try_get(&row, "model").unwrap_or_default();
+    let upstream_task_id: String = sqlx::Row::try_get(&row, "upstream_task_id").unwrap_or_default();
+    let endpoint: String = sqlx::Row::try_get(&row, "upstream_endpoint").unwrap_or_default();
+    let encrypted_key: Option<String> =
+        sqlx::Row::try_get(&row, "credential_ciphertext").unwrap_or(None);
+    let duration: i64 = sqlx::Row::try_get(&row, "duration_seconds").unwrap_or(0);
+    let resolution: String = sqlx::Row::try_get(&row, "resolution").unwrap_or_default();
+    let rate: i64 = sqlx::Row::try_get(&row, "rate_micros_per_second").unwrap_or(0);
+    let reserved: i64 = sqlx::Row::try_get(&row, "reserved_micros").unwrap_or(0);
+    let price_id: String = sqlx::Row::try_get(&row, "price_id").unwrap_or_default();
+    let settled: i64 = sqlx::Row::try_get(&row, "settled").unwrap_or(0);
+    let cached: Option<String> = sqlx::Row::try_get(&row, "response_json").unwrap_or(None);
+    if settled != 0 {
+        if let Some(cached) = cached.and_then(|v| serde_json::from_str::<Value>(&v).ok()) {
+            return Ok(Json(cached));
+        }
+    }
+    let credential = match encrypted_key {
+        Some(k) => decrypt_credential(&s.credentials_key, &k)
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "模型密钥无法解密"))?,
+        None => s.upstream_key.as_str().to_string(),
+    };
+    let base = endpoint
+        .strip_suffix(DASHSCOPE_VIDEO_PATH)
+        .unwrap_or(endpoint.trim_end_matches('/'));
+    let mut poll_url = reqwest::Url::parse(&format!("{}/", base.trim_end_matches('/')))
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "视频渠道地址无效"))?;
+    poll_url
+        .path_segments_mut()
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "视频渠道地址无效"))?
+        .pop_if_empty()
+        .push("tasks")
+        .push(&upstream_task_id);
+    let upstream = s
+        .http
+        .get(poll_url)
+        .bearer_auth(&credential)
+        .send()
+        .await
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "视频任务查询失败"))?;
+    let upstream_status = upstream.status();
+    let bytes = upstream.bytes().await.unwrap_or_default();
+    if !upstream_status.is_success() {
+        return Err((
+            upstream_status,
+            Json(
+                serde_json::from_slice(&bytes)
+                    .unwrap_or(json!({"error":{"message":"上游任务查询失败"}})),
+            ),
+        ));
+    }
+    let mut response: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "视频任务状态无法解析"))?;
+    let task_status = response
+        .pointer("output.task_status")
+        .and_then(Value::as_str)
+        .or_else(|| response.get("task_status").and_then(Value::as_str))
+        .unwrap_or("PENDING")
+        .to_ascii_uppercase();
+    response["task_id"] = json!(task_id);
+    let successful = task_status == "SUCCEEDED";
+    let terminal = successful
+        || ["FAILED", "CANCELED", "CANCELLED", "UNKNOWN"].contains(&task_status.as_str());
+    if terminal {
+        let actual = if successful {
+            rate.saturating_mul(duration)
+        } else {
+            0
+        };
+        let usage_status = if successful { "success" } else { "failed" };
+        let mut tx =
+            s.db.begin()
+                .await
+                .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频任务结算失败"))?;
+        sqlx::query("INSERT OR IGNORE INTO quota_ledger(id,request_id,user_id,department_id,api_key_id,entry_type,amount_micros,idempotency_key) VALUES(?,?,?,?,?,?,?,?)")
+            .bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&task_user_id).bind(&task_department_id).bind(&task_api_key_id).bind("reserve").bind(-reserved).bind(format!("{request_id}:release")).execute(&mut *tx).await
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频额度释放失败"))?;
+        if successful {
+            sqlx::query("INSERT OR IGNORE INTO quota_ledger(id,request_id,user_id,department_id,api_key_id,entry_type,amount_micros,idempotency_key) VALUES(?,?,?,?,?,?,?,?)")
+                .bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&task_user_id).bind(&task_department_id).bind(&task_api_key_id).bind("charge").bind(actual).bind(format!("{request_id}:charge")).execute(&mut *tx).await
+                .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频费用记录失败"))?;
+        }
+        sqlx::query("INSERT OR IGNORE INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,output_tokens,cost_micros,price_id,video_duration_seconds,video_resolution) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&request_id).bind(&request_id).bind(&task_user_id).bind(&task_department_id).bind(&task_api_key_id).bind(&model).bind("dashscope_video").bind("pay_as_you_go").bind(usage_status).bind(0_i64).bind(actual).bind(&price_id).bind(duration).bind(&resolution).execute(&mut *tx).await
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频用量记录失败"))?;
+        let saved = serde_json::to_string(&response).unwrap_or_else(|_| "{}".into());
+        sqlx::query("UPDATE video_tasks SET task_status=?,settled=1,response_json=?,updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND settled=0")
+            .bind(&task_status).bind(saved).bind(&task_id).execute(&mut *tx).await
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频任务状态更新失败"))?;
+        tx.commit()
+            .await
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "视频任务结算提交失败"))?;
+    } else {
+        let saved = serde_json::to_string(&response).unwrap_or_else(|_| "{}".into());
+        let _ = sqlx::query("UPDATE video_tasks SET task_status=?,response_json=?,updated_at=CURRENT_TIMESTAMP WHERE task_id=? AND settled=0")
+            .bind(&task_status).bind(saved).bind(&task_id).execute(&s.db).await;
+    }
+    Ok(Json(response))
+}
+
 async fn stream_openai_chat(
     s: AppState,
     claims: Claims,
@@ -2834,7 +3376,7 @@ async fn stream_openai_chat(
         .and_then(Value::as_str)
         .ok_or_else(|| fail(StatusCode::BAD_REQUEST, "请求缺少 model 字段"))?
         .to_string();
-    let route=sqlx::query("SELECT model_key,upstream_model,protocol,endpoint,billing_mode,enabled,credential_ciphertext FROM model_routes WHERE model_key=?").bind(&requested_model).fetch_optional(&s.db).await.map_err(|_|fail(StatusCode::SERVICE_UNAVAILABLE,"模型路由读取失败"))?.ok_or_else(||fail(StatusCode::NOT_FOUND,"请求的模型未配置"))?;
+    let route = resolve_model_route(&s, &requested_model).await?;
     let model_key: String = sqlx::Row::try_get(&route, "model_key").unwrap_or_default();
     let upstream_model: String = sqlx::Row::try_get(&route, "upstream_model").unwrap_or_default();
     let protocol: String = sqlx::Row::try_get(&route, "protocol").unwrap_or_default();
@@ -2868,7 +3410,7 @@ async fn stream_openai_chat(
         None => s.upstream_key.as_str().to_string(),
     };
     let now = Utc::now();
-    let (window_start, window_end, legacy_night) = billing_window(now);
+    let (window_start, window_end, legacy_night, _) = billing_window(&s.db, now).await;
     let is_night = offpeak_for_model(&s.db, &model_key, now, legacy_night).await;
     let price=sqlx::query_as::<_,PriceRow>("SELECT * FROM model_prices WHERE model=? AND mode=? AND active=1 AND julianday(effective_from)<=julianday(?) ORDER BY julianday(effective_from) DESC LIMIT 1").bind(&model_key).bind(&mode).bind(now.to_rfc3339()).fetch_optional(&s.db).await.map_err(|_|fail(StatusCode::SERVICE_UNAVAILABLE,"计价配置读取失败"))?.ok_or_else(||fail(StatusCode::SERVICE_UNAVAILABLE,"该模型尚未配置有效价格"))?;
     let max_tokens = body
@@ -3122,10 +3664,14 @@ async fn openai_models(
     headers: HeaderMap,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
     let _ = api_actor(&headers, &s).await?;
-    let rows=sqlx::query_as::<_,(String,String)>("SELECT model_key,source FROM model_routes WHERE enabled=1 AND protocol='openai' ORDER BY model_key").fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"模型目录查询失败"))?;
+    // Match the models that can actually be called through the OpenAI
+    // Chat Completions endpoint: it currently supports OpenAI-compatible,
+    // pay-as-you-go routes only.
+    let rows=sqlx::query_as::<_,(String,String)>("SELECT model_key,source FROM model_routes WHERE enabled=1 AND protocol='openai' AND billing_mode='pay_as_you_go' UNION SELECT m.alias_model,r.source FROM model_mappings m JOIN model_routes r ON r.id=m.route_id WHERE m.enabled=1 AND r.enabled=1 AND r.protocol='openai' AND r.billing_mode='pay_as_you_go' ORDER BY 1").fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"模型目录查询失败"))?;
+    let created = Utc::now().timestamp();
     let data: Vec<Value> = rows
         .into_iter()
-        .map(|(id, source)| json!({"id":id,"object":"model","owned_by":source}))
+        .map(|(id, source)| json!({"id":id,"object":"model","created":created,"owned_by":source}))
         .collect();
     Ok(Json(json!({"object":"list","data":data})))
 }
@@ -3133,7 +3679,10 @@ async fn prices(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<PriceRow>>, (StatusCode, Json<Value>)> {
-    let _ = actor(&headers, &s.jwt_secret)?;
+    let me = actor(&headers, &s).await?;
+    if me.role == "department_admin" || me.role == "user" {
+        return Err(fail(StatusCode::FORBIDDEN, "需要平台管理员权限"));
+    }
     let r =
         sqlx::query_as::<_, PriceRow>("SELECT * FROM model_prices ORDER BY effective_from DESC")
             .fetch_all(&s.db)
@@ -3146,7 +3695,7 @@ async fn add_price(
     headers: HeaderMap,
     Json(i): Json<PriceInput>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
-    let a = admin(&headers, &s.jwt_secret)?;
+    let a = admin(&headers, &s).await?;
     if i.model.trim().is_empty()
         || i.mode != "pay_as_you_go"
         || [
@@ -3161,6 +3710,9 @@ async fn add_price(
             i.input_image_2k_micros,
             i.output_image_1k_micros,
             i.output_image_2k_micros,
+            i.video_480p_micros_per_second,
+            i.video_720p_micros_per_second,
+            i.video_1080p_micros_per_second,
         ]
         .iter()
         .any(|x| *x < 0)
@@ -3186,8 +3738,8 @@ async fn add_price(
         .with_timezone(&Utc)
         .to_rfc3339();
     let id = Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO model_prices(id,model,mode,input_per_million_micros,output_per_million_micros,cache_per_million_micros,night_input_per_million_micros,night_output_per_million_micros,night_cache_per_million_micros,input_image_1k_micros,input_image_2k_micros,output_image_1k_micros,output_image_2k_micros,effective_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(&id).bind(&i.model).bind(&i.mode).bind(i.input_per_million_micros).bind(i.output_per_million_micros).bind(i.cache_per_million_micros).bind(i.input_per_million_micros / 2).bind(i.output_per_million_micros / 2).bind(i.cache_per_million_micros / 2).bind(i.input_image_1k_micros).bind(i.input_image_2k_micros).bind(i.output_image_1k_micros).bind(i.output_image_2k_micros).bind(effective).execute(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"价格保存失败"))?;
+    sqlx::query("INSERT INTO model_prices(id,model,mode,input_per_million_micros,output_per_million_micros,cache_per_million_micros,night_input_per_million_micros,night_output_per_million_micros,night_cache_per_million_micros,input_image_1k_micros,input_image_2k_micros,output_image_1k_micros,output_image_2k_micros,video_480p_micros_per_second,video_720p_micros_per_second,video_1080p_micros_per_second,effective_from) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&id).bind(&i.model).bind(&i.mode).bind(i.input_per_million_micros).bind(i.output_per_million_micros).bind(i.cache_per_million_micros).bind(i.input_per_million_micros / 2).bind(i.output_per_million_micros / 2).bind(i.cache_per_million_micros / 2).bind(i.input_image_1k_micros).bind(i.input_image_2k_micros).bind(i.output_image_1k_micros).bind(i.output_image_2k_micros).bind(i.video_480p_micros_per_second).bind(i.video_720p_micros_per_second).bind(i.video_1080p_micros_per_second).bind(effective).execute(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"价格保存失败"))?;
     audit(
         &s.db,
         &a.sub,
@@ -3202,7 +3754,7 @@ async fn protocols(
     State(s): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ProtocolRow>>, (StatusCode, Json<Value>)> {
-    let _ = actor(&headers, &s.jwt_secret)?;
+    let _ = actor(&headers, &s).await?;
     let r=sqlx::query_as::<_,ProtocolRow>("SELECT id,model,protocol,base_url,upstream_model,enabled FROM model_protocols ORDER BY protocol").fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"协议查询失败"))?;
     Ok(Json(r))
 }
@@ -3212,7 +3764,7 @@ async fn put_protocol(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(i): Json<ProtocolInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let a = admin(&headers, &s.jwt_secret)?;
+    let a = admin(&headers, &s).await?;
     if !["openai", "anthropic", "dashscope"].contains(&i.protocol.as_str()) {
         return Err(fail(StatusCode::BAD_REQUEST, "协议类型无效"));
     }
@@ -3230,10 +3782,89 @@ async fn put_protocol(
 async fn model_routes(
     State(s): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<ModelRouteRow>>, (StatusCode, Json<Value>)> {
-    let _ = actor(&headers, &s.jwt_secret)?;
-    let rows=sqlx::query_as::<_,ModelRouteRow>("SELECT id,display_name,source,model_key,upstream_model,protocol,endpoint,billing_mode,enabled,(credential_ciphertext IS NOT NULL) AS has_credential FROM model_routes ORDER BY display_name").fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"模型来源查询失败"))?;
-    Ok(Json(rows))
+) -> Result<Json<Vec<Value>>, (StatusCode, Json<Value>)> {
+    let me = actor(&headers, &s).await?;
+    let rows=sqlx::query_as::<_,ModelRouteRow>("SELECT id,display_name,source,model_key,upstream_model,protocol,endpoint,billing_mode,enabled,(credential_ciphertext IS NOT NULL) AS has_credential FROM model_routes WHERE (?='platform_admin' OR enabled=1) ORDER BY display_name").bind(&me.role).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"模型来源查询失败"))?;
+    let routes: Vec<Value> = rows
+        .into_iter()
+        .map(|route| {
+            let mut value = serde_json::to_value(route).unwrap_or_else(|_| json!({}));
+            if me.role != "platform_admin" {
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("endpoint".into(), json!(""));
+                    object.insert("has_credential".into(), json!(false));
+                }
+            }
+            value
+        })
+        .collect();
+    let mut routes = routes;
+    let aliases = sqlx::query("SELECT m.alias_model,r.id,r.display_name,r.source,r.model_key,r.upstream_model,r.protocol,r.billing_mode,r.enabled FROM model_mappings m JOIN model_routes r ON r.id=m.route_id WHERE m.enabled=1 AND r.enabled=1 ORDER BY m.alias_model")
+        .fetch_all(&s.db).await.map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型映射查询失败"))?;
+    for row in aliases {
+        routes.push(json!({"id":format!("mapping:{}",sqlx::Row::try_get::<String,_>(&row,"alias_model").unwrap_or_default()),"display_name":sqlx::Row::try_get::<String,_>(&row,"alias_model").unwrap_or_default(),"source":sqlx::Row::try_get::<String,_>(&row,"source").unwrap_or_default(),"model_key":sqlx::Row::try_get::<String,_>(&row,"alias_model").unwrap_or_default(),"upstream_model":sqlx::Row::try_get::<String,_>(&row,"upstream_model").unwrap_or_default(),"protocol":sqlx::Row::try_get::<String,_>(&row,"protocol").unwrap_or_default(),"endpoint":"","billing_mode":sqlx::Row::try_get::<String,_>(&row,"billing_mode").unwrap_or_default(),"enabled":1,"has_credential":false}));
+    }
+    Ok(Json(routes))
+}
+
+async fn model_mappings(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Value>>, (StatusCode, Json<Value>)> {
+    let _ = admin(&headers, &s).await?;
+    let rows = sqlx::query("SELECT m.alias_model,m.route_id,r.display_name,r.source,r.model_key,r.enabled FROM model_mappings m JOIN model_routes r ON r.id=m.route_id ORDER BY m.alias_model")
+        .fetch_all(&s.db).await.map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型映射查询失败"))?;
+    Ok(Json(rows.iter().map(|r| json!({"alias_model":sqlx::Row::try_get::<String,_>(r,"alias_model").unwrap_or_default(),"route_id":sqlx::Row::try_get::<String,_>(r,"route_id").unwrap_or_default(),"display_name":sqlx::Row::try_get::<String,_>(r,"display_name").unwrap_or_default(),"source":sqlx::Row::try_get::<String,_>(r,"source").unwrap_or_default(),"model_key":sqlx::Row::try_get::<String,_>(r,"model_key").unwrap_or_default(),"enabled":sqlx::Row::try_get::<i64,_>(r,"enabled").unwrap_or(0)})).collect()))
+}
+
+async fn save_model_mapping(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<ModelMappingInput>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = admin(&headers, &s).await?;
+    let alias = input.alias_model.trim();
+    if alias.is_empty() || alias.len() > 160 {
+        return Err(fail(
+            StatusCode::BAD_REQUEST,
+            "映射名称不能为空且不能超过 160 个字符",
+        ));
+    }
+    let exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM model_routes WHERE id=? AND enabled=1")
+            .bind(&input.route_id)
+            .fetch_one(&s.db)
+            .await
+            .unwrap_or(0);
+    if exists == 0 {
+        return Err(fail(StatusCode::NOT_FOUND, "目标渠道模型不存在或已停用"));
+    }
+    sqlx::query("INSERT INTO model_mappings(alias_model,route_id,enabled) VALUES(?,?,1) ON CONFLICT(alias_model) DO UPDATE SET route_id=excluded.route_id,enabled=1")
+        .bind(alias).bind(&input.route_id).execute(&s.db).await.map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型映射保存失败"))?;
+    audit(
+        &s.db,
+        &admin.sub,
+        "model.mapping.save",
+        alias,
+        json!({"route_id":input.route_id}),
+    )
+    .await;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn delete_model_mapping(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(alias): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = admin(&headers, &s).await?;
+    sqlx::query("DELETE FROM model_mappings WHERE alias_model=?")
+        .bind(&alias)
+        .execute(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型映射删除失败"))?;
+    audit(&s.db, &admin.sub, "model.mapping.delete", &alias, json!({})).await;
+    Ok(Json(json!({"ok":true})))
 }
 
 fn upstream_models_url(
@@ -3318,7 +3949,7 @@ async fn discover_models(
     headers: HeaderMap,
     Json(input): Json<ModelDiscoveryInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let claims = admin(&headers, &s.jwt_secret)?;
+    let claims = admin(&headers, &s).await?;
     if !["openai", "anthropic", "dashscope"].contains(&input.protocol.as_str()) {
         return Err(fail(StatusCode::BAD_REQUEST, "不支持该渠道协议的模型发现"));
     }
@@ -3461,7 +4092,7 @@ async fn save_model_batch(
     headers: HeaderMap,
     Json(input): Json<ModelBatchInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let claims = admin(&headers, &s.jwt_secret)?;
+    let claims = admin(&headers, &s).await?;
     if input.source.trim().is_empty()
         || input.endpoint.trim().is_empty()
         || !["openai", "anthropic", "dashscope"].contains(&input.protocol.as_str())
@@ -3553,7 +4184,7 @@ async fn save_model_route(
     axum::extract::Path(id): axum::extract::Path<String>,
     Json(i): Json<ModelRouteInput>,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    let a = admin(&headers, &s.jwt_secret)?;
+    let a = admin(&headers, &s).await?;
     if i.display_name.trim().is_empty()
         || i.source.trim().is_empty()
         || i.model_key.trim().is_empty()
@@ -3590,6 +4221,139 @@ async fn save_model_route(
     .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "来源凭证读取失败"))?;
     sqlx::query("UPDATE model_routes SET protocol=?,endpoint=?,credential_ciphertext=COALESCE(?,credential_ciphertext) WHERE source=? AND id<>?").bind(&i.protocol).bind(i.endpoint.trim()).bind(shared_credential).bind(i.source.trim()).bind(&id).execute(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"来源配置同步失败"))?;
     audit(&s.db,&a.sub,"model.route.save",&id,json!({"model":i.model_key,"source":i.source,"protocol":i.protocol,"enabled":i.enabled,"credential_changed":i.api_key.as_deref().is_some_and(|v|!v.is_empty())})).await;
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn test_model_route(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = admin(&headers, &s).await?;
+    let row = sqlx::query("SELECT model_key,upstream_model,protocol,endpoint,credential_ciphertext,enabled FROM model_routes WHERE id=?")
+        .bind(&id).fetch_optional(&s.db).await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型配置读取失败"))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND, "模型不存在"))?;
+    let model_key: String = sqlx::Row::try_get(&row, "model_key").unwrap_or_default();
+    let upstream_model: String = sqlx::Row::try_get(&row, "upstream_model").unwrap_or_default();
+    let protocol: String = sqlx::Row::try_get(&row, "protocol").unwrap_or_default();
+    let endpoint: String = sqlx::Row::try_get(&row, "endpoint").unwrap_or_default();
+    let enabled: i64 = sqlx::Row::try_get(&row, "enabled").unwrap_or(0);
+    if enabled == 0 {
+        return Err(fail(StatusCode::BAD_REQUEST, "模型当前已停用"));
+    }
+    let encrypted: Option<String> =
+        sqlx::Row::try_get(&row, "credential_ciphertext").unwrap_or(None);
+    let key = match encrypted {
+        Some(value) => decrypt_credential(&s.credentials_key, &value)
+            .map_err(|_| fail(StatusCode::SERVICE_UNAVAILABLE, "模型密钥无法解密"))?,
+        None => s.upstream_key.as_str().to_owned(),
+    };
+    let (url, body) = match protocol.as_str() {
+        "openai" => (
+            resolve_chat_endpoint(&endpoint),
+            json!({"model":upstream_model,"messages":[{"role":"user","content":"Reply with OK."}],"max_tokens":1,"stream":false}),
+        ),
+        "anthropic" => {
+            let base = endpoint
+                .trim()
+                .trim_end_matches('/')
+                .trim_end_matches("/messages");
+            (
+                format!("{base}/messages"),
+                json!({"model":upstream_model,"max_tokens":1,"messages":[{"role":"user","content":"Reply with OK."}]}),
+            )
+        }
+        "dashscope" => {
+            if endpoint.ends_with(DASHSCOPE_VIDEO_PATH) {
+                (
+                    endpoint.clone(),
+                    json!({"model":upstream_model,"input":{"prompt":"A small red ball rolling across a green field."},"parameters":{"size":"832*480","duration":1}}),
+                )
+            } else {
+                let base = endpoint
+                    .trim()
+                    .trim_end_matches('/')
+                    .trim_end_matches("/services/aigc/text-generation/generation");
+                (
+                    format!("{base}/services/aigc/text-generation/generation"),
+                    json!({"model":upstream_model,"input":{"messages":[{"role":"user","content":"Reply with OK."}]},"parameters":{"result_format":"message","max_tokens":1}}),
+                )
+            }
+        }
+        _ => return Err(fail(StatusCode::BAD_REQUEST, "不支持的模型协议")),
+    };
+    let mut request = s.http.post(url).json(&body);
+    request = if protocol == "anthropic" {
+        request
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01")
+    } else {
+        request.bearer_auth(key)
+    };
+    if protocol == "dashscope" && endpoint.ends_with(DASHSCOPE_VIDEO_PATH) {
+        request = request.header("X-DashScope-Async", "enable");
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|_| fail(StatusCode::BAD_GATEWAY, "连接上游失败"))?;
+    let status = response.status();
+    let response_body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        let detail = response_body.chars().take(300).collect::<String>();
+        return Err(fail(
+            StatusCode::BAD_GATEWAY,
+            &format!(
+                "上游返回 HTTP {}{}",
+                status.as_u16(),
+                if detail.is_empty() {
+                    String::new()
+                } else {
+                    format!("：{detail}")
+                }
+            ),
+        ));
+    }
+    audit(
+        &s.db,
+        &admin.sub,
+        "model.route.test",
+        &id,
+        json!({"model":model_key,"protocol":protocol,"ok":true}),
+    )
+    .await;
+    Ok(Json(
+        json!({"ok":true,"model":model_key,"message":"模型调用成功"}),
+    ))
+}
+
+async fn delete_model_route(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let admin = admin(&headers, &s).await?;
+    let model_key =
+        sqlx::query_scalar::<_, String>("SELECT model_key FROM model_routes WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&s.db)
+            .await
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "模型配置读取失败"))?
+            .ok_or_else(|| fail(StatusCode::NOT_FOUND, "模型不存在"))?;
+    sqlx::query("DELETE FROM model_routes WHERE id=?")
+        .bind(&id)
+        .execute(&s.db)
+        .await
+        .map_err(|_| fail(StatusCode::CONFLICT, "模型删除失败"))?;
+    audit(
+        &s.db,
+        &admin.sub,
+        "model.route.delete",
+        &id,
+        json!({"model":model_key}),
+    )
+    .await;
     Ok(Json(json!({"ok":true})))
 }
 async fn audit(db: &SqlitePool, actor: &str, action: &str, target: &str, detail: Value) {
@@ -3735,12 +4499,19 @@ async fn main() -> anyhow::Result<()> {
             "/api/v1/services/aigc/text-generation/generation",
             post(dashscope_generation),
         )
+        .route(
+            "/api/v1/services/aigc/video-generation/video-synthesis",
+            post(dashscope_video_generation),
+        )
+        .route("/api/v1/tasks/{task_id}", get(dashscope_video_task_status))
         .route("/api/departments", get(departments).post(add_department))
         .route("/api/departments/{id}", put(update_department))
         .route("/api/users", get(users).post(add_user))
         .route("/api/users/batch", post(add_users_batch))
         .route("/api/users/{id}/limit", put(set_user_limit))
+        .route("/api/users/{id}/rate-limit", put(set_user_rate_limit))
         .route("/api/users/{id}/department", put(set_user_department))
+        .route("/api/users/{id}/role", put(update_user_role))
         .route("/api/users/{id}/contact", put(update_user_contact))
         .route("/api/api-keys", get(list_api_keys).post(create_api_key))
         .route("/api/api-keys/{id}", axum::routing::delete(revoke_api_key))
@@ -3750,9 +4521,23 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/protocols", get(protocols))
         .route("/api/protocols/{id}", put(put_protocol))
         .route("/api/models", get(model_routes))
+        .route(
+            "/api/model-mappings",
+            get(model_mappings).post(save_model_mapping),
+        )
+        .route(
+            "/api/model-mappings/{alias}",
+            axum::routing::delete(delete_model_mapping),
+        )
         .route("/api/models/discover", post(discover_models))
         .route("/api/models/batch", post(save_model_batch))
-        .route("/api/models/{id}", put(save_model_route))
+        .route("/api/models/{id}/test", post(test_model_route))
+        .route(
+            "/api/models/{id}",
+            put(save_model_route)
+                .delete(delete_model_route)
+                .post(test_model_route),
+        )
         .fallback_service(
             ServeDir::new(&web_dist)
                 .not_found_service(ServeFile::new(format!("{web_dist}/index.html"))),

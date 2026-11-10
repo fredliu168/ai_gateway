@@ -18,6 +18,7 @@ RUN npm run build
 
 FROM debian:bookworm-slim
 COPY --from=backend-build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=backend-build /usr/share/zoneinfo /usr/share/zoneinfo
 RUN useradd --system --uid 10001 --create-home llmroute
 WORKDIR /app
 COPY --from=backend-build /app/target/release/llmroute-server /usr/local/bin/llmroute-server
@@ -26,6 +27,6 @@ COPY --from=frontend-build /app/dist /app/web/dist
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod 755 /usr/local/bin/docker-entrypoint.sh && mkdir -p /app/data && chown -R llmroute:llmroute /app
 USER llmroute
-ENV PORT=7900 DATABASE_URL=sqlite:///app/data/llmroute.db?mode=rwc WEB_DIST=/app/web/dist
+ENV TZ=Asia/Shanghai PORT=7900 DATABASE_URL=sqlite:///app/data/llmroute.db?mode=rwc WEB_DIST=/app/web/dist
 EXPOSE 7900
 ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
