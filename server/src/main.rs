@@ -2518,6 +2518,26 @@ async fn record_failed_call(
         .bind(Uuid::new_v4().to_string()).bind(request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(model).bind(protocol).bind(mode).bind(price_id).bind(latency).bind(error).execute(&s.db).await;
 }
 
+fn upstream_error_detail(status: reqwest::StatusCode, value: &Value, secret: &str) -> String {
+    let reason = value
+        .pointer("/error/message")
+        .or_else(|| value.pointer("/error/Message"))
+        .or_else(|| value.pointer("/error/msg"))
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("Message"))
+        .or_else(|| value.get("detail"))
+        .or_else(|| value.get("error"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("上游服务未返回具体错误信息");
+    let mut reason = reason.chars().take(600).collect::<String>();
+    if !secret.is_empty() {
+        reason = reason.replace(secret, "[已隐藏密钥]");
+    }
+    format!("上游 HTTP {}：{}", status.as_u16(), reason)
+}
+
 async fn resolve_model_route(
     s: &AppState,
     requested_model: &str,
@@ -2616,7 +2636,7 @@ async fn openai_chat(
     let response = s
         .http
         .post(resolve_chat_endpoint(&endpoint))
-        .bearer_auth(upstream_key)
+        .bearer_auth(&upstream_key)
         .json(&body)
         .send()
         .await;
@@ -2672,7 +2692,7 @@ async fn openai_chat(
             &mode,
             &price.id,
             latency,
-            &format!("upstream_http_{}", status.as_u16()),
+            &upstream_error_detail(status, &value, &upstream_key),
         )
         .await;
         return Ok((status, Json(value)).into_response());
@@ -2791,7 +2811,7 @@ async fn openai_image_generation(
     let response = s
         .http
         .post(url)
-        .bearer_auth(credential)
+        .bearer_auth(&credential)
         .json(&body)
         .send()
         .await
@@ -2804,7 +2824,9 @@ async fn openai_image_generation(
     let latency = started.elapsed().as_millis().min(i64::MAX as u128) as i64;
     if !status.is_success() {
         close_reservation(&s, &claims, &request_id, reserve, 0, true).await;
-        let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind("openai").bind(&mode).bind("failed").bind(&price.id).bind(latency).bind(format!("upstream_http_{}",status.as_u16())).execute(&s.db).await;
+        let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
+        let detail = upstream_error_detail(status, &value, &credential);
+        let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind("openai").bind(&mode).bind("failed").bind(&price.id).bind(latency).bind(detail).execute(&s.db).await;
         return Ok((status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response());
     }
     let actual = amount_micros(
@@ -3453,7 +3475,7 @@ async fn stream_openai_chat(
     let request = s
         .http
         .post(resolve_chat_endpoint(&endpoint))
-        .bearer_auth(upstream_key)
+        .bearer_auth(&upstream_key)
         .json(&body)
         .send();
     let upstream_result = if let Some(cancel) = cancellation.as_ref() {
@@ -3503,7 +3525,7 @@ async fn stream_openai_chat(
             &mode,
             &price.id,
             start.elapsed().as_millis() as i64,
-            &format!("upstream_http_{}", status.as_u16()),
+            &upstream_error_detail(status, &value, &upstream_key),
         )
         .await;
         return Ok((status, Json(value)).into_response());
