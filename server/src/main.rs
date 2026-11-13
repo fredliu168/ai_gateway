@@ -2586,6 +2586,16 @@ fn logged_request_content(body: &Value) -> (String, bool) {
     (serde_json::to_string(&body).unwrap_or_else(|_| "{}".into()), false)
 }
 
+fn normalize_developer_role(body: &mut Value) {
+    if let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) {
+        for message in messages {
+            if message.get("role").and_then(Value::as_str) == Some("developer") {
+                message["role"] = json!("system");
+            }
+        }
+    }
+}
+
 async fn save_request_content(db: &SqlitePool, request_id: &str, content: &str, truncated: bool) {
     let _ = sqlx::query("UPDATE usage_records SET request_content=?,request_content_truncated=? WHERE request_id=?")
         .bind(content).bind(truncated as i64).bind(request_id).execute(db).await;
@@ -2616,6 +2626,7 @@ async fn openai_chat(
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         return stream_openai_chat(s, claims, body, None).await;
     }
+    normalize_developer_role(&mut body);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -3460,6 +3471,7 @@ async fn stream_openai_chat(
     cancellation: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
     let (request_content, request_content_truncated) = logged_request_content(&body);
+    normalize_developer_role(&mut body);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
