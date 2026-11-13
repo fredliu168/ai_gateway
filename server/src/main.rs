@@ -561,10 +561,8 @@ struct UsageRow {
     cost_micros: i64,
     latency_ms: i64,
     error_code: Option<String>,
-    request_content: Option<String>,
-    request_content_truncated: i64,
-    response_content: Option<String>,
-    response_content_truncated: i64,
+    has_request_content: i64,
+    has_response_content: i64,
     created_at: String,
 }
 
@@ -2304,7 +2302,7 @@ async fn usage(
     Query(f): Query<UsageFilter>,
 ) -> Result<Json<Vec<UsageRow>>, (StatusCode, Json<Value>)> {
     let me = actor(&headers, &s).await?;
-    let rows=sqlx::query_as::<_,UsageRow>("SELECT r.id,r.request_id,u.username,u.display_name,d.name AS department_name,r.model,r.protocol,r.mode,r.status,r.input_tokens,r.output_tokens,r.cache_tokens,r.video_duration_seconds,r.video_resolution,r.cost_micros,r.latency_ms,r.error_code,r.request_content,r.request_content_truncated,r.response_content,r.response_content_truncated,r.created_at FROM usage_records r JOIN users u ON u.id=r.user_id LEFT JOIN departments d ON d.id=r.department_id WHERE (? IS NULL OR r.department_id=?) AND (? IS NULL OR r.status=?) AND (? IS NULL OR r.model=?) AND (? IS NULL OR r.created_at>=?) AND (? IS NULL OR r.created_at<=?) ORDER BY r.created_at DESC LIMIT 500")
+    let rows=sqlx::query_as::<_,UsageRow>("SELECT r.id,r.request_id,u.username,u.display_name,d.name AS department_name,r.model,r.protocol,r.mode,r.status,r.input_tokens,r.output_tokens,r.cache_tokens,r.video_duration_seconds,r.video_resolution,r.cost_micros,r.latency_ms,r.error_code,(r.request_content IS NOT NULL AND r.request_content<>'') AS has_request_content,(r.response_content IS NOT NULL AND r.response_content<>'') AS has_response_content,r.created_at FROM usage_records r JOIN users u ON u.id=r.user_id LEFT JOIN departments d ON d.id=r.department_id WHERE (? IS NULL OR r.department_id=?) AND (? IS NULL OR r.status=?) AND (? IS NULL OR r.model=?) AND (? IS NULL OR r.created_at>=?) AND (? IS NULL OR r.created_at<=?) ORDER BY r.created_at DESC LIMIT 500")
         .bind(if me.role=="department_admin" {me.department_id.clone()}else{f.department_id.clone()}).bind(if me.role=="department_admin" {me.department_id.clone()}else{f.department_id.clone()}).bind(&f.status).bind(&f.status).bind(&f.model).bind(&f.model).bind(&f.from).bind(&f.from).bind(&f.to).bind(&f.to).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"调用记录查询失败"))?;
     if me.role == "platform_admin" {
         Ok(Json(rows))
@@ -2317,6 +2315,30 @@ async fn usage(
                 .collect(),
         ))
     }
+}
+
+async fn usage_content(
+    State(s): State<AppState>,
+    headers: HeaderMap,
+    axum::extract::Path(request_id): axum::extract::Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let me = actor(&headers, &s).await?;
+    let row = sqlx::query("SELECT u.username,r.department_id,r.request_content,r.request_content_truncated,r.response_content,r.response_content_truncated FROM usage_records r JOIN users u ON u.id=r.user_id WHERE r.request_id=?")
+        .bind(&request_id).fetch_optional(&s.db).await
+        .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR,"调用内容查询失败"))?
+        .ok_or_else(|| fail(StatusCode::NOT_FOUND,"调用记录不存在"))?;
+    let username: String = sqlx::Row::try_get(&row,"username").unwrap_or_default();
+    let department_id: Option<String> = sqlx::Row::try_get(&row,"department_id").unwrap_or(None);
+    let allowed = me.role == "platform_admin"
+        || (me.role == "department_admin" && department_id == me.department_id)
+        || (me.role != "platform_admin" && me.role != "department_admin" && username == me.username);
+    if !allowed { return Err(fail(StatusCode::NOT_FOUND,"调用记录不存在")); }
+    Ok(Json(json!({
+        "request_content":sqlx::Row::try_get::<Option<String>,_>(&row,"request_content").unwrap_or(None),
+        "request_content_truncated":sqlx::Row::try_get::<i64,_>(&row,"request_content_truncated").unwrap_or(0),
+        "response_content":sqlx::Row::try_get::<Option<String>,_>(&row,"response_content").unwrap_or(None),
+        "response_content_truncated":sqlx::Row::try_get::<i64,_>(&row,"response_content_truncated").unwrap_or(0)
+    })))
 }
 
 async fn billing_window(
@@ -4590,6 +4612,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/api-keys/{id}", axum::routing::delete(revoke_api_key))
         .route("/api/api-keys/{id}/stats", get(api_key_stats))
         .route("/api/usage", get(usage))
+        .route("/api/usage/{request_id}/content", get(usage_content))
         .route("/api/prices", get(prices).post(add_price))
         .route("/api/protocols", get(protocols))
         .route("/api/protocols/{id}", put(put_protocol))
