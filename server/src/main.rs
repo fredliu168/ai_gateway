@@ -2542,8 +2542,6 @@ fn upstream_error_detail(status: reqwest::StatusCode, value: &Value, secret: &st
     format!("上游 HTTP {}：{}", status.as_u16(), reason)
 }
 
-const MAX_LOGGED_REQUEST_BYTES: usize = 65_536;
-
 fn logged_request_content(body: &Value) -> (String, bool) {
     fn redact(value: &mut Value) {
         match value {
@@ -2563,11 +2561,7 @@ fn logged_request_content(body: &Value) -> (String, bool) {
     }
     let mut body = body.clone();
     redact(&mut body);
-    let serialized = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
-    if serialized.len() <= MAX_LOGGED_REQUEST_BYTES { return (serialized, false); }
-    let mut end = MAX_LOGGED_REQUEST_BYTES;
-    while !serialized.is_char_boundary(end) { end -= 1; }
-    (serialized[..end].to_string(), true)
+    (serde_json::to_string(&body).unwrap_or_else(|_| "{}".into()), false)
 }
 
 async fn save_request_content(db: &SqlitePool, request_id: &str, content: &str, truncated: bool) {
