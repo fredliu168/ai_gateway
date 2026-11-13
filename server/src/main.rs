@@ -561,6 +561,8 @@ struct UsageRow {
     cost_micros: i64,
     latency_ms: i64,
     error_code: Option<String>,
+    request_content: Option<String>,
+    request_content_truncated: i64,
     created_at: String,
 }
 
@@ -2300,7 +2302,7 @@ async fn usage(
     Query(f): Query<UsageFilter>,
 ) -> Result<Json<Vec<UsageRow>>, (StatusCode, Json<Value>)> {
     let me = actor(&headers, &s).await?;
-    let rows=sqlx::query_as::<_,UsageRow>("SELECT r.id,r.request_id,u.username,u.display_name,d.name AS department_name,r.model,r.protocol,r.mode,r.status,r.input_tokens,r.output_tokens,r.cache_tokens,r.video_duration_seconds,r.video_resolution,r.cost_micros,r.latency_ms,r.error_code,r.created_at FROM usage_records r JOIN users u ON u.id=r.user_id LEFT JOIN departments d ON d.id=r.department_id WHERE (? IS NULL OR r.department_id=?) AND (? IS NULL OR r.status=?) AND (? IS NULL OR r.model=?) AND (? IS NULL OR r.created_at>=?) AND (? IS NULL OR r.created_at<=?) ORDER BY r.created_at DESC LIMIT 500")
+    let rows=sqlx::query_as::<_,UsageRow>("SELECT r.id,r.request_id,u.username,u.display_name,d.name AS department_name,r.model,r.protocol,r.mode,r.status,r.input_tokens,r.output_tokens,r.cache_tokens,r.video_duration_seconds,r.video_resolution,r.cost_micros,r.latency_ms,r.error_code,r.request_content,r.request_content_truncated,r.created_at FROM usage_records r JOIN users u ON u.id=r.user_id LEFT JOIN departments d ON d.id=r.department_id WHERE (? IS NULL OR r.department_id=?) AND (? IS NULL OR r.status=?) AND (? IS NULL OR r.model=?) AND (? IS NULL OR r.created_at>=?) AND (? IS NULL OR r.created_at<=?) ORDER BY r.created_at DESC LIMIT 500")
         .bind(if me.role=="department_admin" {me.department_id.clone()}else{f.department_id.clone()}).bind(if me.role=="department_admin" {me.department_id.clone()}else{f.department_id.clone()}).bind(&f.status).bind(&f.status).bind(&f.model).bind(&f.model).bind(&f.from).bind(&f.from).bind(&f.to).bind(&f.to).fetch_all(&s.db).await.map_err(|_|fail(StatusCode::INTERNAL_SERVER_ERROR,"调用记录查询失败"))?;
     if me.role == "platform_admin" {
         Ok(Json(rows))
@@ -2538,6 +2540,39 @@ fn upstream_error_detail(status: reqwest::StatusCode, value: &Value, secret: &st
     format!("上游 HTTP {}：{}", status.as_u16(), reason)
 }
 
+const MAX_LOGGED_REQUEST_BYTES: usize = 65_536;
+
+fn logged_request_content(body: &Value) -> (String, bool) {
+    fn redact(value: &mut Value) {
+        match value {
+            Value::Object(map) => {
+                for (key, value) in map.iter_mut() {
+                    let key = key.to_ascii_lowercase();
+                    if key.contains("api_key") || key.contains("apikey") || key.contains("authorization") || key.contains("password") || key.contains("secret") || key == "access_token" {
+                        *value = Value::String("[REDACTED]".into());
+                    } else {
+                        redact(value);
+                    }
+                }
+            }
+            Value::Array(items) => items.iter_mut().for_each(redact),
+            _ => {}
+        }
+    }
+    let mut body = body.clone();
+    redact(&mut body);
+    let serialized = serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".into());
+    if serialized.len() <= MAX_LOGGED_REQUEST_BYTES { return (serialized, false); }
+    let mut end = MAX_LOGGED_REQUEST_BYTES;
+    while !serialized.is_char_boundary(end) { end -= 1; }
+    (serialized[..end].to_string(), true)
+}
+
+async fn save_request_content(db: &SqlitePool, request_id: &str, content: &str, truncated: bool) {
+    let _ = sqlx::query("UPDATE usage_records SET request_content=?,request_content_truncated=? WHERE request_id=?")
+        .bind(content).bind(truncated as i64).bind(request_id).execute(db).await;
+}
+
 async fn resolve_model_route(
     s: &AppState,
     requested_model: &str,
@@ -2554,6 +2589,7 @@ async fn openai_chat(
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     let claims = api_actor(&headers, &s).await?;
+    let (request_content, request_content_truncated) = logged_request_content(&body);
     if body.get("stream").and_then(Value::as_bool).unwrap_or(false) {
         return stream_openai_chat(s, claims, body, None).await;
     }
@@ -2656,6 +2692,7 @@ async fn openai_chat(
                 "upstream_connection",
             )
             .await;
+            save_request_content(&s.db, &request_id, &request_content, request_content_truncated).await;
             return Err(fail(StatusCode::BAD_GATEWAY, "上游模型连接失败"));
         }
     };
@@ -2677,6 +2714,7 @@ async fn openai_chat(
                 "invalid_upstream_response",
             )
             .await;
+            save_request_content(&s.db, &request_id, &request_content, request_content_truncated).await;
             return Err(fail(StatusCode::BAD_GATEWAY, "上游响应格式无效"));
         }
     };
@@ -2695,10 +2733,11 @@ async fn openai_chat(
             &upstream_error_detail(status, &value, &upstream_key),
         )
         .await;
+        save_request_content(&s.db, &request_id, &request_content, request_content_truncated).await;
         return Ok((status, Json(value)).into_response());
     }
     let Some(usage) = value.get("usage") else {
-        let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("pending_usage").bind(&price.id).bind(latency).bind("usage_missing").execute(&s.db).await;
+        let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code,request_content,request_content_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("pending_usage").bind(&price.id).bind(latency).bind("usage_missing").bind(&request_content).bind(request_content_truncated as i64).execute(&s.db).await;
         return Ok((status, Json(value)).into_response());
     };
     let input = usage
@@ -2729,8 +2768,8 @@ async fn openai_chat(
         .saturating_add(amount_micros(cached, cache_rate))
         .saturating_add(amount_micros(output, out_rate));
     close_reservation(&s, &claims, &request_id, reserve, actual, false).await;
-    let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,input_tokens,output_tokens,cache_tokens,cost_micros,price_id,latency_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-        .bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("success").bind(input).bind(output).bind(cached).bind(actual).bind(&price.id).bind(latency).execute(&s.db).await;
+    let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,input_tokens,output_tokens,cache_tokens,cost_micros,price_id,latency_ms,request_content,request_content_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("success").bind(input).bind(output).bind(cached).bind(actual).bind(&price.id).bind(latency).bind(&request_content).bind(request_content_truncated as i64).execute(&s.db).await;
     Ok((status, Json(value)).into_response())
 }
 
@@ -2740,6 +2779,7 @@ async fn openai_image_generation(
     Json(mut body): Json<Value>,
 ) -> Result<impl IntoResponse, (StatusCode, Json<Value>)> {
     let claims = api_actor(&headers, &s).await?;
+    let (request_content, request_content_truncated) = logged_request_content(&body);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -2826,7 +2866,7 @@ async fn openai_image_generation(
         close_reservation(&s, &claims, &request_id, reserve, 0, true).await;
         let value = serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null);
         let detail = upstream_error_detail(status, &value, &credential);
-        let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind("openai").bind(&mode).bind("failed").bind(&price.id).bind(latency).bind(detail).execute(&s.db).await;
+        let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code,request_content,request_content_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind("openai").bind(&mode).bind("failed").bind(&price.id).bind(latency).bind(detail).bind(&request_content).bind(request_content_truncated as i64).execute(&s.db).await;
         return Ok((status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response());
     }
     let actual = amount_micros(
@@ -2843,7 +2883,7 @@ async fn openai_image_generation(
             .max(price.night_output_per_million_micros),
     );
     close_reservation(&s, &claims, &request_id, reserve, actual, false).await;
-    let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,input_tokens,output_tokens,cost_micros,price_id,latency_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind("openai").bind(&mode).bind("success").bind(estimate).bind(1_i64).bind(actual).bind(&price.id).bind(latency).execute(&s.db).await;
+    let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,input_tokens,output_tokens,cost_micros,price_id,latency_ms,request_content,request_content_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind("openai").bind(&mode).bind("success").bind(estimate).bind(1_i64).bind(actual).bind(&price.id).bind(latency).bind(&request_content).bind(request_content_truncated as i64).execute(&s.db).await;
     Ok((status, [(header::CONTENT_TYPE, "application/json")], bytes).into_response())
 }
 
@@ -3393,6 +3433,7 @@ async fn stream_openai_chat(
     mut body: Value,
     cancellation: Option<Arc<tokio::sync::Notify>>,
 ) -> Result<Response, (StatusCode, Json<Value>)> {
+    let (request_content, request_content_truncated) = logged_request_content(&body);
     let requested_model = body
         .get("model")
         .and_then(Value::as_str)
@@ -3484,6 +3525,7 @@ async fn stream_openai_chat(
             _ = cancel.notified() => {
                 close_reservation(&s, &claims, &request_id, reserve, 0, true).await;
                 record_failed_call(&s, &claims, &request_id, &model_key, &protocol, &mode, &price.id, start.elapsed().as_millis() as i64, "client_cancelled").await;
+                save_request_content(&s.db, &request_id, &request_content, request_content_truncated).await;
                 return Err(fail(StatusCode::REQUEST_TIMEOUT, "Agent 执行已中断"));
             }
         }
@@ -3506,6 +3548,7 @@ async fn stream_openai_chat(
                 "upstream_connection",
             )
             .await;
+            save_request_content(&s.db, &request_id, &request_content, request_content_truncated).await;
             return Err(fail(StatusCode::BAD_GATEWAY, "上游模型连接失败"));
         }
     };
@@ -3528,6 +3571,7 @@ async fn stream_openai_chat(
             &upstream_error_detail(status, &value, &upstream_key),
         )
         .await;
+        save_request_content(&s.db, &request_id, &request_content, request_content_truncated).await;
         return Ok((status, Json(value)).into_response());
     }
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(32);
@@ -3628,6 +3672,7 @@ async fn stream_openai_chat(
                 },
             )
             .await;
+            save_request_content(&app.db, &request_id, &request_content, request_content_truncated).await;
             let frame = format!("data: {}\n\n", json!({"error":{"message":error}}));
             let _ = tx.send(Ok(Bytes::from(frame))).await;
             let _ = tx.send(Ok(Bytes::from_static(b"data: [DONE]\n\n"))).await;
@@ -3661,11 +3706,11 @@ async fn stream_openai_chat(
                 .saturating_add(amount_micros(cached, cache_rate))
                 .saturating_add(amount_micros(output, out_rate));
             close_reservation(&app, &claims, &request_id, reserve, actual, false).await;
-            let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,input_tokens,output_tokens,cache_tokens,cost_micros,price_id,latency_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("success").bind(input).bind(output).bind(cached).bind(actual).bind(&price.id).bind(latency).execute(&app.db).await;
+            let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,input_tokens,output_tokens,cache_tokens,cost_micros,price_id,latency_ms,request_content,request_content_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("success").bind(input).bind(output).bind(cached).bind(actual).bind(&price.id).bind(latency).bind(&request_content).bind(request_content_truncated as i64).execute(&app.db).await;
         } else {
             // Keep the reservation when the provider omits usage so a completed
             // but unmetered stream cannot bypass the user's monthly quota.
-            let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("pending_usage").bind(&price.id).bind(latency).bind("stream_usage_missing").execute(&app.db).await;
+            let _=sqlx::query("INSERT INTO usage_records(id,request_id,user_id,department_id,api_key_id,model,protocol,mode,status,price_id,latency_ms,error_code,request_content,request_content_truncated) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)").bind(Uuid::new_v4().to_string()).bind(&request_id).bind(&claims.sub).bind(&claims.department_id).bind(&claims.api_key_id).bind(&model_key).bind(&protocol).bind(&mode).bind("pending_usage").bind(&price.id).bind(latency).bind("stream_usage_missing").bind(&request_content).bind(request_content_truncated as i64).execute(&app.db).await;
         }
     });
     let stream = futures_util::stream::unfold(rx, |mut receiver| async {
