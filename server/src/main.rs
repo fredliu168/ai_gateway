@@ -2674,8 +2674,9 @@ async fn openai_chat(
         .and_then(Value::as_i64)
         .unwrap_or(8192)
         .clamp(1, 131072);
-    if body.get("max_tokens").is_none() && body.get("max_completion_tokens").is_none() {
-        body["max_tokens"] = json!(max_tokens);
+    body["max_tokens"] = json!(max_tokens);
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_completion_tokens");
     }
     body["model"] = json!(upstream_model);
     let estimated_input = (body.to_string().len() as i64).max(1);
@@ -2961,7 +2962,7 @@ fn messages_to_openai(body: Value, protocol: &str) -> Value {
     };
     for (src, dst) in [
         ("max_tokens", "max_tokens"),
-        ("max_completion_tokens", "max_completion_tokens"),
+        ("max_completion_tokens", "max_tokens"),
         ("temperature", "temperature"),
         ("top_p", "top_p"),
         ("stop", "stop"),
@@ -3520,8 +3521,9 @@ async fn stream_openai_chat(
         .and_then(Value::as_i64)
         .unwrap_or(8192)
         .clamp(1, 131072);
-    if body.get("max_tokens").is_none() && body.get("max_completion_tokens").is_none() {
-        body["max_tokens"] = json!(max_tokens);
+    body["max_tokens"] = json!(max_tokens);
+    if let Some(object) = body.as_object_mut() {
+        object.remove("max_completion_tokens");
     }
     body["model"] = json!(upstream_model);
     body["stream"] = json!(true);
